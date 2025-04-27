@@ -84,7 +84,7 @@ app.get('/api/tables/:tableName/:id', (req, res) => {
 });
 
 // Create record (Modified to send webhook notification)
-app.post('/api/tables/:tableName', (req, res) => {
+app.post('/api/tables/:tableName', async (req, res) => {
  const tableName = req.params.tableName;
 
   let recordDataString;
@@ -138,46 +138,44 @@ app.post('/api/tables/:tableName', (req, res) => {
 
   console.log(`[${tableName}] Executing INSERT query...`);
 
- db.query(`INSERT INTO ${tableName} SET ?`, data, (err, result) => {
-  if (err) {
+  db.query(`INSERT INTO ${tableName} SET ?`, data, async (err, result) => {
+    if (err) {
       console.error(`[${tableName}] Database error during INSERT:`, err);
-   return res.status(500).json({ error: err.message });
-  }
+      return res.status(500).json({ error: err.message });
+    }
 
     const newRecordId = result.insertId;
     console.log(`[${tableName}] Insert successful, new id: ${newRecordId}`);
 
     // --- Webhook Notification to Power Automate ---
     if (POWER_AUTOMATE_WEBHOOK_URL) {
-        const notificationPayload = {
-            tableName: tableName,
-            recordDetails: {
-                id: newRecordId, // Include the newly generated ID
-                ...data // Include the rest of the inserted data
-            }
-        };
+      const notificationPayload = {
+        tableName,
+        recordDetails: { id: newRecordId, ...data }
+      };
 
-        console.log(`[${tableName}] Sending webhook notification to Power Automate...`);
-
-        axios.post(POWER_AUTOMATE_WEBHOOK_URL, notificationPayload)
-            .then(response => {
-                console.log(`[${tableName}] Webhook notification sent successfully. Status: ${response.status}`);
-            })
-            .catch(error => {
-                // Log the error but do NOT return an error response to the client
-                // The database insert was successful, the webhook is a secondary action.
-                console.error(`[${tableName}] Failed to send webhook notification to Power Automate:`, error.message);
-                // You might want more detailed error logging here depending on needs
-                // console.error(error.response?.data || error.message); 
-            });
+      console.log(`[${tableName}] Sending webhook notification to Power Automate at ${POWER_AUTOMATE_WEBHOOK_URL}…`);
+      try {
+        const response = await axios.post(POWER_AUTOMATE_WEBHOOK_URL, notificationPayload, {
+          headers: { 'Content-Type': 'application/json' }
+        });
+        console.log(`[${tableName}] Webhook notification sent. Status: ${response.status}`);
+      } catch (error) {
+        console.error(
+          `[${tableName}] Failed to send webhook:`,
+          error.response?.status,
+          error.response?.data || error.message
+        );
+        // don't fail the client insert if webhook fails
+      }
     } else {
-        console.log(`[${tableName}] Webhook URL not set, skipping notification.`);
+      console.warn(`[${tableName}] POWER_AUTOMATE_WEBHOOK_URL not set; skipping notification.`);
     }
     // --- End Webhook Notification ---
 
-    // Respond to the client indicating successful creation
-  res.json({ id: newRecordId, ...data }); 
- });
+    // Finally respond to the client
+    res.json({ id: newRecordId, ...data });
+  });
 });
 
 // Update record (Kept the fix from previous interaction)
