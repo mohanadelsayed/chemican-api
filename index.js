@@ -90,35 +90,77 @@ app.post('/api/tables/:tableName', (req, res) => {
 
 // Update record
 app.put('/api/tables/:tableName/:id', (req, res) => {
- const tableName = req.params.tableName;
- const id = req.params.id;
+   const tableName = req.params.tableName;
+   const id = req.params.id;
+   
+    // Log the full received body for debugging if needed later
+    // console.log("--- Update Request Details ---");
+  // console.log("Received PUT request body:", req.body); 
   
-  // Assuming Power Automate nests the actual data under 'body'
-   const data = req.body.body; 
+    let recordDataString;
   
-   // Basic validation (consider adding checks for 'data' existence and type)
+    // Safely try to access the nested string data
+    try {
+      recordDataString = req.body.body.$; // Access the value under 'body' and '$'
+      if (typeof recordDataString !== 'string') {
+          // If it's not a string, the structure is not what we expected
+          console.error("Expected req.body.body.$ to be a string, but received:", typeof recordDataString);
+          return res.status(400).json({ error: "Invalid data format: Expected a string payload under 'body.$'" });
+      }
+    } catch (e) {
+        // Catch errors if req.body, req.body.body, or req.body.body.$ doesn't exist
+        console.error("Error accessing nested data in request body:", e);
+        return res.status(400).json({ error: "Invalid request body structure" });
+    }
+  
+    let data;
+  
+    // Try to parse the string as JSON
+    try {
+      data = JSON.parse(recordDataString);
+      if (typeof data !== 'object' || data === null) {
+           console.error("Parsed data is not an object:", data);
+           return res.status(400).json({ error: "Invalid data format: Parsed payload is not a JSON object" });
+      }
+    } catch (e) {
+        // Catch errors if the string is not valid JSON
+        console.error("Error parsing JSON string from req.body.body.$:", e);
+        return res.status(400).json({ error: "Invalid data format: Payload under 'body.$' is not valid JSON" });
+    }
+    
+   // Basic validation for table name
    if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+     console.log("Invalid table name:", tableName);
    return res.status(400).json({ error: 'Invalid table name' });
    }
   
-    // It's also good practice to remove the 'id' from the data object
+    // It's good practice to remove the 'id' from the data object
     // as you are using it in the WHERE clause and shouldn't update the ID itself.
-    if (data && data.id) {
+    if (data.id !== undefined) { // Check if id exists in the parsed object
+        console.log("Removing id property from data:", data.id);
         delete data.id;
     }
+    
+    console.log("Data object prepared for update query:", data); // Log the final data object
   
     // Check if there's any data left to update after removing id
-    if (!data || Object.keys(data).length === 0) {
+    if (Object.keys(data).length === 0) {
+        console.log("No update data provided after processing."); 
         return res.status(400).json({ error: 'No update data provided' });
     }
-
- db.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, id], (err) => {
-  if (err) {
-  return res.status(500).json({ error: err.message });
-}
-      // Respond with the updated record structure
-  res.json({ id, ...req.body.body }); // Use the original body for the response if needed, or just the updated data
-  });
+  
+    console.log("Executing UPDATE query for table:", tableName, "id:", id); // Log just before query
+  
+  db.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, id], (err) => {
+   if (err) {
+        console.error("Database error during UPDATE:", err); // Log the actual error on the server
+   return res.status(500).json({ error: err.message });
+  }
+      console.log("Update successful for id:", id); // Log success
+  
+      // Respond with the updated record structure - use the parsed data
+   res.json({ id, ...data }); 
+   });
   });
 
 // Delete record
