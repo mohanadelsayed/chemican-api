@@ -90,22 +90,36 @@ app.post('/api/tables/:tableName', (req, res) => {
 
 // Update record
 app.put('/api/tables/:tableName/:id', (req, res) => {
-  const tableName = req.params.tableName;
-  const id = req.params.id;
-  const data = req.body;
+ const tableName = req.params.tableName;
+ const id = req.params.id;
   
-  // Basic validation
-  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
-    return res.status(400).json({ error: 'Invalid table name' });
-  }
+  // Assuming Power Automate nests the actual data under 'body'
+   const data = req.body.body; 
   
-  db.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, id], (err) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+   // Basic validation (consider adding checks for 'data' existence and type)
+   if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+   return res.status(400).json({ error: 'Invalid table name' });
+   }
+  
+    // It's also good practice to remove the 'id' from the data object
+    // as you are using it in the WHERE clause and shouldn't update the ID itself.
+    if (data && data.id) {
+        delete data.id;
     }
-    res.json({ id, ...data });
+  
+    // Check if there's any data left to update after removing id
+    if (!data || Object.keys(data).length === 0) {
+        return res.status(400).json({ error: 'No update data provided' });
+    }
+
+ db.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, id], (err) => {
+  if (err) {
+  return res.status(500).json({ error: err.message });
+}
+      // Respond with the updated record structure
+  res.json({ id, ...req.body.body }); // Use the original body for the response if needed, or just the updated data
   });
-});
+  });
 
 // Delete record
 app.delete('/api/tables/:tableName/:id', (req, res) => {
