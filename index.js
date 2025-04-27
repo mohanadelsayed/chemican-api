@@ -72,21 +72,79 @@ app.get('/api/tables/:tableName/:id', (req, res) => {
 
 // Create record
 app.post('/api/tables/:tableName', (req, res) => {
-  const tableName = req.params.tableName;
-  const data = req.body;
+   const tableName = req.params.tableName;
   
-  // Basic validation
-  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
-    return res.status(400).json({ error: 'Invalid table name' });
-  }
+    // Log the full received body for debugging if needed later
+    // console.log("--- Create Request Details ---");
+   // console.log("Received POST request body:", req.body); 
   
-  db.query(`INSERT INTO ${tableName} SET ?`, data, (err, result) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
+    let recordDataString;
+  
+    // Safely try to access the nested string data
+    try {
+      // Access the value under 'body' and '$' - adjust if Power Automate uses a different key like 'record'
+      recordDataString = req.body.body.$; 
+      if (typeof recordDataString !== 'string') {
+          console.error("Expected req.body.body.$ to be a string for CreateRecord, but received:", typeof recordDataString);
+          return res.status(400).json({ error: "Invalid data format: Expected a string payload under 'body.$'" });
+      }
+    } catch (e) {
+        // Catch errors if req.body, req.body.body, or req.body.body.$ doesn't exist
+        console.error("Error accessing nested data in request body for CreateRecord:", e);
+        return res.status(400).json({ error: "Invalid request body structure" });
     }
-    res.json({ id: result.insertId, ...data });
-  });
-});
+  
+    let data;
+  
+    // Try to parse the string as JSON
+    try {
+      data = JSON.parse(recordDataString);
+       if (typeof data !== 'object' || data === null) {
+           console.error("Parsed data for CreateRecord is not an object:", data);
+           return res.status(400).json({ error: "Invalid data format: Parsed payload is not a JSON object" });
+      }
+    } catch (e) {
+        // Catch errors if the string is not valid JSON
+        console.error("Error parsing JSON string from req.body.body.$ for CreateRecord:", e);
+        return res.status(400).json({ error: "Invalid data format: Payload under 'body.$' is not valid JSON" });
+    }
+   
+   // Basic validation for table name
+  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+     console.log("Invalid table name for CreateRecord:", tableName);
+   return res.status(400).json({ error: 'Invalid table name' });
+   }
+  
+    // Optional: Remove 'id' if it's mistakenly sent in a creation request body
+    // The database should assign the ID automatically.
+    if (data.id !== undefined) {
+        console.warn("ID property found in create data body, removing it:", data.id);
+        delete data.id;
+    }
+  
+    console.log("Data object prepared for create query:", data); // Log the final data object
+  
+    // Check if there's any data left to insert
+    if (Object.keys(data).length === 0) {
+        console.log("No insert data provided after processing."); 
+        // Depending on your schema, an empty insert might be valid or not.
+        // Returning 400 here assumes you always need at least one column to insert.
+        return res.status(400).json({ error: 'No insert data provided' });
+    }
+  
+    console.log("Executing INSERT query for table:", tableName, "with data:", data); // Log just before query
+  
+   db.query(`INSERT INTO ${tableName} SET ?`, data, (err, result) => {
+   if (err) {
+        console.error("Database error during INSERT:", err); // Log the actual error on the server
+  return res.status(500).json({ error: err.message });
+ }
+      console.log("Insert successful, new id:", result.insertId); // Log success
+  
+      // Respond with the new id and the data that was inserted
+  res.json({ id: result.insertId, ...data }); 
+ });
+  });;
 
 // Update record
 app.put('/api/tables/:tableName/:id', (req, res) => {
