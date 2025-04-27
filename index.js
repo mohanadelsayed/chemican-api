@@ -9,6 +9,7 @@ const port = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
 
 // Database connection
 const db = mysql.createPool({
@@ -52,6 +53,9 @@ app.get('/api/tables/:tableName', (req, res) => {
 app.get('/api/tables/:tableName/:id', (req, res) => {
   const tableName = req.params.tableName;
   const id = req.params.id;
+  const data = req.body;
+
+  console.log("Update request body:", data); // For debugging
   
   // Basic validation
   if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
