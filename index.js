@@ -274,32 +274,43 @@ app.get('/api/tables/:tableName/:id', async (req, res) => {
   }
 });
 
-// Create record (already sends webhook notification)
+// Create record with more flexible body handling
 app.post('/api/tables/:tableName', async (req, res) => {
   const tableName = req.params.tableName;
-  let recordDataString;
+  let data;
   
   try {
-    recordDataString = req.body.body.$;
-    if (typeof recordDataString !== 'string') {
-      console.error(`[${tableName}] Expected req.body.body.$ to be a string, but received:`, typeof recordDataString);
-      return res.status(400).json({ error: "Invalid data format: Expected a string payload under 'body.$'" });
+    // More flexible handling of the input
+    if (req.body.body && req.body.body.$) {
+      // Original format from test tab: body.$ as string
+      const recordDataString = req.body.body.$;
+      
+      if (typeof recordDataString === 'string') {
+        data = JSON.parse(recordDataString);
+      } else {
+        // If it's already an object
+        data = recordDataString;
+      }
+    } else if (req.body.body) {
+      // Flow might send body as the direct container
+      if (typeof req.body.body === 'string') {
+        data = JSON.parse(req.body.body);
+      } else {
+        data = req.body.body;
+      }
+    } else {
+      // Direct body content as fallback
+      data = req.body;
     }
-  } catch (e) {
-    console.error(`[${tableName}] Error accessing nested data in request body:`, e);
-    return res.status(400).json({ error: "Invalid request body structure" });
-  }
-
-  let data;
-  try {
-    data = JSON.parse(recordDataString);
+    
+    // Validate we got an object
     if (typeof data !== 'object' || data === null) {
       console.error(`[${tableName}] Parsed data is not an object:`, data);
-      return res.status(400).json({ error: "Invalid data format: Parsed payload is not a JSON object" });
+      return res.status(400).json({ error: "Invalid data format: Failed to extract a valid JSON object from request" });
     }
   } catch (e) {
-    console.error(`[${tableName}] Error parsing JSON string:`, e);
-    return res.status(400).json({ error: "Invalid data format: Payload under 'body.$' is not valid JSON" });
+    console.error(`[${tableName}] Error processing request body:`, e, req.body);
+    return res.status(400).json({ error: "Invalid data format: Unable to parse JSON payload" });
   }
 
   if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
@@ -318,7 +329,7 @@ app.post('/api/tables/:tableName', async (req, res) => {
   }
 
   try {
-    console.log(`[${tableName}] Executing INSERT query...`);
+    console.log(`[${tableName}] Executing INSERT query with data:`, data);
     const [result] = await pool.query(`INSERT INTO ${tableName} SET ?`, data);
     const newRecordId = result.insertId;
     console.log(`[${tableName}] Insert successful, new id: ${newRecordId}`);
@@ -351,33 +362,44 @@ app.post('/api/tables/:tableName', async (req, res) => {
   }
 });
 
-// Update record
+// Update record with similar flexible body handling
 app.put('/api/tables/:tableName/:id', async (req, res) => {
   const tableName = req.params.tableName;
   const id = req.params.id;
-  let recordDataString;
+  let data;
   
   try {
-    recordDataString = req.body.body.$;
-    if (typeof recordDataString !== 'string') {
-      console.error(`[${tableName}] Expected req.body.body.$ to be a string for UpdateRecord, but received:`, typeof recordDataString);
-      return res.status(400).json({ error: "Invalid data format: Expected a string payload under 'body.$'" });
+    // More flexible handling of the input
+    if (req.body.body && req.body.body.$) {
+      // Original format from test tab: body.$ as string
+      const recordDataString = req.body.body.$;
+      
+      if (typeof recordDataString === 'string') {
+        data = JSON.parse(recordDataString);
+      } else {
+        // If it's already an object
+        data = recordDataString;
+      }
+    } else if (req.body.body) {
+      // Flow might send body as the direct container
+      if (typeof req.body.body === 'string') {
+        data = JSON.parse(req.body.body);
+      } else {
+        data = req.body.body;
+      }
+    } else {
+      // Direct body content as fallback
+      data = req.body;
     }
-  } catch (e) {
-    console.error(`[${tableName}] Error accessing nested data in request body for UpdateRecord:`, e);
-    return res.status(400).json({ error: "Invalid request body structure" });
-  }
-
-  let data;
-  try {
-    data = JSON.parse(recordDataString);
+    
+    // Validate we got an object
     if (typeof data !== 'object' || data === null) {
       console.error(`[${tableName}] Parsed data for UpdateRecord is not an object:`, data);
-      return res.status(400).json({ error: "Invalid data format: Parsed payload is not a JSON object" });
+      return res.status(400).json({ error: "Invalid data format: Failed to extract a valid JSON object from request" });
     }
   } catch (e) {
-    console.error(`[${tableName}] Error parsing JSON string from req.body.body.$ for UpdateRecord:`, e);
-    return res.status(400).json({ error: "Invalid data format: Payload under 'body.$' is not valid JSON" });
+    console.error(`[${tableName}] Error processing request body for UpdateRecord:`, e, req.body);
+    return res.status(400).json({ error: "Invalid data format: Unable to parse JSON payload" });
   }
 
   if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
@@ -396,7 +418,7 @@ app.put('/api/tables/:tableName/:id', async (req, res) => {
   }
 
   try {
-    console.log(`[${tableName}] Executing UPDATE query for id: ${id}...`);
+    console.log(`[${tableName}] Executing UPDATE query for id: ${id} with data:`, data);
     await pool.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, id]);
     console.log(`[${tableName}] Update successful for id: ${id}`);
     res.json({ id, ...data });
@@ -404,128 +426,4 @@ app.put('/api/tables/:tableName/:id', async (req, res) => {
     console.error(`[${tableName}] Database error during UPDATE:`, err);
     res.status(500).json({ error: err.message });
   }
-});
-
-// Delete record
-app.delete('/api/tables/:tableName/:id', async (req, res) => {
-  const tableName = req.params.tableName;
-  const id = req.params.id;
-  
-  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
-    return res.status(400).json({ error: 'Invalid table name' });
-  }
-  
-  try {
-    await pool.query(`DELETE FROM ${tableName} WHERE id = ?`, [id]);
-    res.json({ message: 'Record deleted successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Get current tracking state
-app.get('/api/tracking-status', async (req, res) => {
-  try {
-    const [trackingInfo] = await pool.query(`
-      SELECT * FROM webhook_processed_records
-    `);
-    
-    res.json({
-      trackingRecords: trackingInfo,
-      inMemoryLastId: lastKnownFormSubmitId,
-      isInitialCheckComplete
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Reset tracking for a table
-app.post('/api/reset-tracking/:tableName', async (req, res) => {
-  try {
-    const tableName = req.params.tableName;
-    if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
-      return res.status(400).json({ error: 'Invalid table name' });
-    }
-    
-    // Reset to specified ID or find current max
-    let resetToId = req.body.resetToId;
-    
-    if (resetToId === undefined) {
-      // Reset to current max ID
-      const [maxRows] = await pool.query(`
-        SELECT COALESCE(MAX(id), 0) AS max_id FROM ${tableName}
-      `);
-      resetToId = maxRows[0].max_id || 0;
-    }
-    
-    // Update the tracking table
-    await pool.query(`
-      UPDATE webhook_processed_records
-      SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
-      WHERE table_name = ?
-    `, [resetToId, tableName]);
-    
-    // Update in-memory variable if it's form_submits
-    if (tableName === 'form_submits') {
-      lastKnownFormSubmitId = resetToId;
-    }
-    
-    res.json({ 
-      message: `Tracking for ${tableName} reset to ID ${resetToId}`,
-      resetToId
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Health check endpoint for monitoring
-app.get('/health', async (req, res) => {
-  try {
-    // Check database connection
-    await pool.query('SELECT 1');
-    
-    // Return current tracking state
-    const [trackingInfo] = await pool.query(`
-      SELECT * FROM webhook_processed_records
-      WHERE table_name = 'form_submits'
-    `);
-    
-    res.json({
-      status: 'healthy',
-      lastProcessedId: lastKnownFormSubmitId,
-      isInitialCheckComplete,
-      trackingInfo: trackingInfo[0] || null,
-      webhookUrl: POWER_AUTOMATE_WEBHOOK_URL ? '(configured)' : '(not configured)'
-    });
-  } catch (err) {
-    res.status(500).json({
-      status: 'unhealthy',
-      error: err.message
-    });
-  }
-});
-
-// Force check for new submissions (for testing)
-app.post('/api/force-check', async (req, res) => {
-  try {
-    await checkForNewFormSubmissions();
-    res.json({
-      status: 'check initiated',
-      lastProcessedId: lastKnownFormSubmitId
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Initialize the database and start the server
-initializeDatabase().then(() => {
-  app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
-  });
-}).catch(err => {
-  console.error('Failed to initialize application:', err);
-  process.exit(1);
 });
