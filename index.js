@@ -1,5 +1,5 @@
 const express = require('express');
-const mysql = require('mysql2/promise'); // Using promise-based MySQL for async/await
+const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -8,7 +8,6 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // --- Environment Variables ---
-// Ensure these environment variables are set in your Railway project settings
 const MYSQL_HOST = process.env.MYSQL_HOST;
 const MYSQL_USER = process.env.MYSQL_USER;
 const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD;
@@ -28,6 +27,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 
 // Create database connection pool
 let pool;
+let lastKnownFormSubmitId = 0;
 
 async function initializeDatabase() {
   try {
@@ -46,9 +46,15 @@ async function initializeDatabase() {
     
     console.log('Database pool created successfully');
     
-    // Create a database trigger to monitor the form_submits table
+    // Create tracking table for external submissions if needed
+    await createTrackingTable();
+    
+    // Initialize the lastKnownFormSubmitId
+    await initializeLastKnownId();
+    
+    // Start polling for new external form submissions
     if (POWER_AUTOMATE_WEBHOOK_URL) {
-      await setupFormSubmitsTrigger();
+      startFormSubmissionPolling();
     }
     
   } catch (err) {
@@ -57,153 +63,142 @@ async function initializeDatabase() {
   }
 }
 
-// Function to set up the database trigger and event handling
-async function setupFormSubmitsTrigger() {
+async function createTrackingTable() {
   try {
-    const connection = await pool.getConnection();
-    
-    // First, check if the trigger already exists and drop it if it does
-    const [triggerCheck] = await connection.query(`
-      SELECT TRIGGER_NAME 
-      FROM information_schema.TRIGGERS 
-      WHERE TRIGGER_SCHEMA = ? AND TRIGGER_NAME = 'after_form_submit_insert'
-    `, [MYSQL_DATABASE]);
-    
-    if (triggerCheck.length > 0) {
-      console.log('Dropping existing form_submits trigger...');
-      await connection.query('DROP TRIGGER IF EXISTS after_form_submit_insert');
-    }
-    
-    // Create a new table to store notifications that need to be sent
-    console.log('Creating webhook_notifications table if not exists...');
-    await connection.query(`
-      CREATE TABLE IF NOT EXISTS webhook_notifications (
-        id INT AUTO_INCREMENT PRIMARY KEY,
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS webhook_processed_records (
         table_name VARCHAR(100) NOT NULL,
-        record_id INT NOT NULL,
-        record_data JSON,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        processed BOOLEAN DEFAULT FALSE,
-        process_attempts INT DEFAULT 0
+        last_processed_id INT NOT NULL DEFAULT 0,
+        last_check_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (table_name)
       )
     `);
     
-    // Create trigger on form_submits table
-    console.log('Creating trigger for form_submits table...');
-    await connection.query(`
-      CREATE TRIGGER after_form_submit_insert
-      AFTER INSERT ON form_submits
-      FOR EACH ROW
-      BEGIN
-        INSERT INTO webhook_notifications (table_name, record_id, record_data)
-        VALUES ('form_submits', NEW.id, JSON_OBJECT(
-          'id', NEW.id
-          ${await getFormSubmitsColumns()}
-        ));
-      END
+    // Insert a row for form_submits if it doesn't exist
+    await pool.query(`
+      INSERT IGNORE INTO webhook_processed_records (table_name, last_processed_id)
+      VALUES ('form_submits', 0)
     `);
     
-    connection.release();
-    console.log('Form submissions trigger setup successfully');
-    
-    // Start the webhook notification processor
-    startWebhookProcessor();
-    
+    console.log('Tracking table created successfully');
   } catch (err) {
-    console.error('Error setting up form_submits trigger:', err);
+    console.error('Error creating tracking table:', err);
   }
 }
 
-// Helper function to get all columns from form_submits to include in the trigger
-async function getFormSubmitsColumns() {
+async function initializeLastKnownId() {
   try {
-    const [columns] = await pool.query(`
-      SELECT COLUMN_NAME 
-      FROM INFORMATION_SCHEMA.COLUMNS 
-      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'form_submits' AND COLUMN_NAME != 'id'
-    `, [MYSQL_DATABASE]);
+    // Get the last processed ID from the tracking table
+    const [rows] = await pool.query(`
+      SELECT last_processed_id FROM webhook_processed_records
+      WHERE table_name = 'form_submits'
+    `);
     
-    return columns.map(col => `, '${col.COLUMN_NAME}', NEW.${col.COLUMN_NAME}`).join('');
+    if (rows.length > 0) {
+      lastKnownFormSubmitId = rows[0].last_processed_id;
+      console.log(`Initialized lastKnownFormSubmitId to ${lastKnownFormSubmitId}`);
+    } else {
+      // If no record exists, find the highest existing ID
+      const [maxRows] = await pool.query(`
+        SELECT COALESCE(MAX(id), 0) AS max_id FROM form_submits
+      `);
+      
+      lastKnownFormSubmitId = maxRows[0].max_id || 0;
+      console.log(`No tracking record found. Set lastKnownFormSubmitId to current max: ${lastKnownFormSubmitId}`);
+      
+      // Update the tracking table
+      await pool.query(`
+        INSERT INTO webhook_processed_records (table_name, last_processed_id)
+        VALUES ('form_submits', ?)
+        ON DUPLICATE KEY UPDATE last_processed_id = ?
+      `, [lastKnownFormSubmitId, lastKnownFormSubmitId]);
+    }
   } catch (err) {
-    console.error('Error getting form_submits columns:', err);
-    return '';
+    console.error('Error initializing lastKnownFormSubmitId:', err);
   }
 }
 
-// Function to process webhook notifications periodically
-function startWebhookProcessor() {
-  console.log('Starting webhook notification processor...');
+function startFormSubmissionPolling() {
+  // First immediate check
+  checkForNewFormSubmissions();
   
-  // Process immediately when starting up
-  processWebhookNotifications();
-  
-  // Then process every 30 seconds
-  setInterval(processWebhookNotifications, 30000);
+  // Then check every 10 seconds (more frequent polling to catch submissions faster)
+  setInterval(checkForNewFormSubmissions, 10000);
 }
 
-// Function to process unprocessed webhook notifications
-async function processWebhookNotifications() {
+async function checkForNewFormSubmissions() {
   if (!POWER_AUTOMATE_WEBHOOK_URL) {
     return;
   }
   
-  let connection;
   try {
-    connection = await pool.getConnection();
+    // Check for new form submissions with ID greater than lastKnownFormSubmitId
+    const [newSubmissions] = await pool.query(`
+      SELECT * FROM form_submits
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT 50
+    `, [lastKnownFormSubmitId]);
     
-    // Get unprocessed notifications, limit to 10 at a time to avoid overwhelming
-    const [notifications] = await connection.query(`
-      SELECT * FROM webhook_notifications 
-      WHERE processed = FALSE AND process_attempts < 3
-      ORDER BY created_at ASC
-      LIMIT 10
-    `);
-    
-    if (notifications.length === 0) {
+    if (newSubmissions.length === 0) {
       return;
     }
     
-    console.log(`Processing ${notifications.length} webhook notifications...`);
+    console.log(`Found ${newSubmissions.length} new form submissions to process`);
     
-    for (const notification of notifications) {
+    for (const submission of newSubmissions) {
       try {
-        // Send the notification to Power Automate
-        const response = await axios.post(POWER_AUTOMATE_WEBHOOK_URL, {
-          tableName: notification.table_name,
-          recordDetails: JSON.parse(notification.record_data)
-        }, {
-          headers: { 'Content-Type': 'application/json' }
-        });
+        // Update the lastKnownFormSubmitId before sending the webhook
+        // This ensures we don't miss records even if webhook sending fails
+        lastKnownFormSubmitId = submission.id;
         
-        if (response.status >= 200 && response.status < 300) {
-          // Update the record to mark as processed
-          await connection.query(`
-            UPDATE webhook_notifications 
-            SET processed = TRUE 
-            WHERE id = ?
-          `, [notification.id]);
-          
-          console.log(`Successfully sent webhook notification for ${notification.table_name} record ${notification.record_id}`);
-        } else {
-          throw new Error(`Received status code ${response.status}`);
-        }
+        // Send the webhook notification
+        await sendWebhookNotification('form_submits', submission);
+        
+        // Update the tracking table after successful processing
+        await pool.query(`
+          UPDATE webhook_processed_records
+          SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
+          WHERE table_name = 'form_submits'
+        `, [lastKnownFormSubmitId]);
+        
+        console.log(`Successfully processed form submission ID: ${submission.id}`);
       } catch (err) {
-        // Increment the attempts counter
-        await connection.query(`
-          UPDATE webhook_notifications 
-          SET process_attempts = process_attempts + 1 
-          WHERE id = ?
-        `, [notification.id]);
-        
-        console.error(`Failed to send webhook notification for ${notification.table_name} record ${notification.record_id}:`, err.message);
+        console.error(`Failed to process form submission ID ${submission.id}:`, err);
+        // Continue with next submission even if this one fails
       }
     }
   } catch (err) {
-    console.error('Error processing webhook notifications:', err);
-  } finally {
-    if (connection) {
-      connection.release();
-    }
+    console.error('Error checking for new form submissions:', err);
+  }
+}
+
+async function sendWebhookNotification(tableName, recordData) {
+  if (!POWER_AUTOMATE_WEBHOOK_URL) {
+    return;
+  }
+  
+  console.log(`Sending webhook notification for ${tableName} record ID: ${recordData.id}`);
+  
+  try {
+    const notificationPayload = {
+      tableName,
+      recordDetails: recordData
+    };
+    
+    const response = await axios.post(POWER_AUTOMATE_WEBHOOK_URL, notificationPayload, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    console.log(`Webhook notification sent. Status: ${response.status}`);
+    return true;
+  } catch (error) {
+    console.error(
+      `Failed to send webhook:`,
+      error.response?.status,
+      error.response?.data || error.message
+    );
+    throw error;
   }
 }
 
@@ -298,25 +293,22 @@ app.post('/api/tables/:tableName', async (req, res) => {
     const newRecordId = result.insertId;
     console.log(`[${tableName}] Insert successful, new id: ${newRecordId}`);
 
-    // --- Webhook Notification to Power Automate ---
-    if (POWER_AUTOMATE_WEBHOOK_URL) {
-      const notificationPayload = {
-        tableName,
-        recordDetails: { id: newRecordId, ...data }
-      };
+    // For form_submits table, update the lastKnownFormSubmitId to avoid duplicate webhook sending
+    if (tableName === 'form_submits') {
+      lastKnownFormSubmitId = Math.max(lastKnownFormSubmitId, newRecordId);
+      await pool.query(`
+        UPDATE webhook_processed_records
+        SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
+        WHERE table_name = 'form_submits'
+      `, [lastKnownFormSubmitId]);
+    }
 
-      console.log(`[${tableName}] Sending webhook notification to Power Automate...`);
+    // Send webhook notification for all tables
+    if (POWER_AUTOMATE_WEBHOOK_URL) {
       try {
-        const response = await axios.post(POWER_AUTOMATE_WEBHOOK_URL, notificationPayload, {
-          headers: { 'Content-Type': 'application/json' }
-        });
-        console.log(`[${tableName}] Webhook notification sent. Status: ${response.status}`);
+        await sendWebhookNotification(tableName, { id: newRecordId, ...data });
       } catch (error) {
-        console.error(
-          `[${tableName}] Failed to send webhook:`,
-          error.response?.status,
-          error.response?.data || error.message
-        );
+        console.error(`[${tableName}] Failed to send webhook notification, but will continue.`);
       }
     }
 
@@ -394,6 +386,45 @@ app.delete('/api/tables/:tableName/:id', async (req, res) => {
   try {
     await pool.query(`DELETE FROM ${tableName} WHERE id = ?`, [id]);
     res.json({ message: 'Record deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Health check endpoint for monitoring
+app.get('/health', async (req, res) => {
+  try {
+    // Check database connection
+    await pool.query('SELECT 1');
+    
+    // Return current tracking state
+    const [trackingInfo] = await pool.query(`
+      SELECT * FROM webhook_processed_records
+      WHERE table_name = 'form_submits'
+    `);
+    
+    res.json({
+      status: 'healthy',
+      lastProcessedId: lastKnownFormSubmitId,
+      trackingInfo: trackingInfo[0] || null,
+      webhookUrl: POWER_AUTOMATE_WEBHOOK_URL ? '(configured)' : '(not configured)'
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: err.message
+    });
+  }
+});
+
+// Force check for new submissions (for testing)
+app.post('/api/force-check', async (req, res) => {
+  try {
+    await checkForNewFormSubmissions();
+    res.json({
+      status: 'check initiated',
+      lastProcessedId: lastKnownFormSubmitId
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
