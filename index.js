@@ -28,6 +28,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // Create database connection pool
 let pool;
 let lastKnownFormSubmitId = 0;
+let isInitialCheckComplete = false;
 
 async function initializeDatabase() {
   try {
@@ -113,6 +114,9 @@ async function initializeLastKnownId() {
         ON DUPLICATE KEY UPDATE last_processed_id = ?
       `, [lastKnownFormSubmitId, lastKnownFormSubmitId]);
     }
+    
+    // Mark that we've completed the initial check and setup
+    isInitialCheckComplete = true;
   } catch (err) {
     console.error('Error initializing lastKnownFormSubmitId:', err);
   }
@@ -122,51 +126,77 @@ function startFormSubmissionPolling() {
   // First immediate check
   checkForNewFormSubmissions();
   
-  // Then check every 10 seconds (more frequent polling to catch submissions faster)
+  // Then check every 10 seconds
   setInterval(checkForNewFormSubmissions, 10000);
 }
 
 async function checkForNewFormSubmissions() {
-  if (!POWER_AUTOMATE_WEBHOOK_URL) {
+  if (!POWER_AUTOMATE_WEBHOOK_URL || !isInitialCheckComplete) {
     return;
   }
   
   try {
-    // Check for new form submissions with ID greater than lastKnownFormSubmitId
+    // Get current tracked ID from database to ensure we're using the latest value
+    const [trackingRow] = await pool.query(`
+      SELECT last_processed_id FROM webhook_processed_records
+      WHERE table_name = 'form_submits'
+    `);
+    
+    if (trackingRow.length === 0) {
+      console.error('No tracking record found for form_submits');
+      return;
+    }
+    
+    const currentTrackedId = trackingRow[0].last_processed_id;
+    
+    // Check for new form submissions with ID greater than the tracked ID
     const [newSubmissions] = await pool.query(`
       SELECT * FROM form_submits
       WHERE id > ?
       ORDER BY id ASC
       LIMIT 50
-    `, [lastKnownFormSubmitId]);
+    `, [currentTrackedId]);
     
     if (newSubmissions.length === 0) {
       return;
     }
     
-    console.log(`Found ${newSubmissions.length} new form submissions to process`);
+    console.log(`Found ${newSubmissions.length} new form submissions to process (IDs > ${currentTrackedId})`);
+    
+    let highestProcessedId = currentTrackedId;
     
     for (const submission of newSubmissions) {
       try {
-        // Update the lastKnownFormSubmitId before sending the webhook
-        // This ensures we don't miss records even if webhook sending fails
-        lastKnownFormSubmitId = submission.id;
-        
-        // Send the webhook notification
-        await sendWebhookNotification('form_submits', submission);
-        
-        // Update the tracking table after successful processing
-        await pool.query(`
-          UPDATE webhook_processed_records
-          SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
-          WHERE table_name = 'form_submits'
-        `, [lastKnownFormSubmitId]);
-        
-        console.log(`Successfully processed form submission ID: ${submission.id}`);
+        if (submission.id > highestProcessedId) {
+          // Send the webhook notification
+          await sendWebhookNotification('form_submits', submission);
+          
+          // Update our tracking variable
+          highestProcessedId = submission.id;
+          
+          console.log(`Successfully processed form submission ID: ${submission.id}`);
+        } else {
+          console.log(`Skipping already processed form submission ID: ${submission.id}`);
+        }
       } catch (err) {
         console.error(`Failed to process form submission ID ${submission.id}:`, err);
         // Continue with next submission even if this one fails
       }
+    }
+    
+    // Only update the database if we actually processed new records
+    if (highestProcessedId > currentTrackedId) {
+      // Update our in-memory tracking
+      lastKnownFormSubmitId = highestProcessedId;
+      
+      // Update the tracking table after processing all submissions
+      await pool.query(`
+        UPDATE webhook_processed_records
+        SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
+        WHERE table_name = 'form_submits'
+      `, [highestProcessedId]);
+      
+      console.log(`Updated last processed ID to ${highestProcessedId}`);
     }
   } catch (err) {
     console.error('Error checking for new form submissions:', err);
@@ -295,12 +325,14 @@ app.post('/api/tables/:tableName', async (req, res) => {
 
     // For form_submits table, update the lastKnownFormSubmitId to avoid duplicate webhook sending
     if (tableName === 'form_submits') {
+      // Update the tracking table immediately to prevent duplicate processing
       lastKnownFormSubmitId = Math.max(lastKnownFormSubmitId, newRecordId);
       await pool.query(`
         UPDATE webhook_processed_records
         SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
         WHERE table_name = 'form_submits'
       `, [lastKnownFormSubmitId]);
+      console.log(`Updated form_submits tracking to ID: ${lastKnownFormSubmitId}`);
     }
 
     // Send webhook notification for all tables
@@ -391,6 +423,63 @@ app.delete('/api/tables/:tableName/:id', async (req, res) => {
   }
 });
 
+// Get current tracking state
+app.get('/api/tracking-status', async (req, res) => {
+  try {
+    const [trackingInfo] = await pool.query(`
+      SELECT * FROM webhook_processed_records
+    `);
+    
+    res.json({
+      trackingRecords: trackingInfo,
+      inMemoryLastId: lastKnownFormSubmitId,
+      isInitialCheckComplete
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reset tracking for a table
+app.post('/api/reset-tracking/:tableName', async (req, res) => {
+  try {
+    const tableName = req.params.tableName;
+    if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+      return res.status(400).json({ error: 'Invalid table name' });
+    }
+    
+    // Reset to specified ID or find current max
+    let resetToId = req.body.resetToId;
+    
+    if (resetToId === undefined) {
+      // Reset to current max ID
+      const [maxRows] = await pool.query(`
+        SELECT COALESCE(MAX(id), 0) AS max_id FROM ${tableName}
+      `);
+      resetToId = maxRows[0].max_id || 0;
+    }
+    
+    // Update the tracking table
+    await pool.query(`
+      UPDATE webhook_processed_records
+      SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
+      WHERE table_name = ?
+    `, [resetToId, tableName]);
+    
+    // Update in-memory variable if it's form_submits
+    if (tableName === 'form_submits') {
+      lastKnownFormSubmitId = resetToId;
+    }
+    
+    res.json({ 
+      message: `Tracking for ${tableName} reset to ID ${resetToId}`,
+      resetToId
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Health check endpoint for monitoring
 app.get('/health', async (req, res) => {
   try {
@@ -406,6 +495,7 @@ app.get('/health', async (req, res) => {
     res.json({
       status: 'healthy',
       lastProcessedId: lastKnownFormSubmitId,
+      isInitialCheckComplete,
       trackingInfo: trackingInfo[0] || null,
       webhookUrl: POWER_AUTOMATE_WEBHOOK_URL ? '(configured)' : '(not configured)'
     });
