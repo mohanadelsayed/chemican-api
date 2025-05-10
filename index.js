@@ -392,9 +392,9 @@ app.post('/api/tables/:tableName', async (req, res) => {
 });
 
 // Update record with flexible body handling
-app.put('/api/tables/:tableName/:id', async (req, res) => {
+app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
-  const id = req.params.id;
+  const idOrGuid = req.params.idOrGuid;
   let data;
   
   try {
@@ -422,16 +422,65 @@ app.put('/api/tables/:tableName/:id', async (req, res) => {
     delete data.id;
   }
 
+  // Remove guid if present to avoid overwriting the record guid
+  if (data.guid !== undefined) {
+    console.log(`[${tableName}] Removing guid property from data:`, data.guid);
+    delete data.guid;
+  }
+
   if (Object.keys(data).length === 0) {
     console.log(`[${tableName}] No update data provided after processing.`);
     return res.status(400).json({ error: 'No update data provided or data format is incorrect' });
   }
 
   try {
-    console.log(`[${tableName}] Executing UPDATE query for id: ${id} with data:`, JSON.stringify(data));
-    await pool.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, id]);
-    console.log(`[${tableName}] Update successful for id: ${id}`);
-    res.json({ id: parseInt(id), ...data });
+    let queryCondition, queryParams;
+    
+    // Check if idOrGuid is numeric (likely an ID) or string (likely a GUID)
+    if (!isNaN(idOrGuid)) {
+      console.log(`[${tableName}] Executing UPDATE query for id: ${idOrGuid} with data:`, JSON.stringify(data));
+      queryCondition = 'id = ?';
+      queryParams = [data, idOrGuid];
+    } else {
+      console.log(`[${tableName}] Executing UPDATE query for guid: ${idOrGuid} with data:`, JSON.stringify(data));
+      queryCondition = 'guid = ?';
+      queryParams = [data, idOrGuid];
+    }
+    
+    const [updateResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE ${queryCondition}`, queryParams);
+    
+    if (updateResult.affectedRows === 0) {
+      // If no rows were updated with the first condition, try the other one
+      if (!isNaN(idOrGuid)) {
+        // If we tried ID first, now try GUID
+        console.log(`[${tableName}] No rows updated by id, trying guid: ${idOrGuid}`);
+        const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE guid = ?`, [data, idOrGuid]);
+        if (retryResult.affectedRows === 0) {
+          return res.status(404).json({ error: 'Record not found' });
+        }
+      } else {
+        // If we tried GUID first, now try ID (if it could potentially be numeric)
+        if (idOrGuid.match(/^\d+$/)) {
+          console.log(`[${tableName}] No rows updated by guid, trying id: ${idOrGuid}`);
+          const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, idOrGuid]);
+          if (retryResult.affectedRows === 0) {
+            return res.status(404).json({ error: 'Record not found' });
+          }
+        } else {
+          return res.status(404).json({ error: 'Record not found' });
+        }
+      }
+    }
+    
+    console.log(`[${tableName}] Update successful for idOrGuid: ${idOrGuid}`);
+    
+    // Fetch the updated record to return it
+    let [updatedRecord] = await pool.query(
+      `SELECT * FROM ${tableName} WHERE id = ? OR guid = ? LIMIT 1`, 
+      [idOrGuid, idOrGuid]
+    );
+    
+    res.json(updatedRecord[0] || { message: 'Record updated successfully' });
   } catch (err) {
     console.error(`[${tableName}] Database error during UPDATE:`, err);
     res.status(500).json({ error: err.message });
@@ -439,18 +488,39 @@ app.put('/api/tables/:tableName/:id', async (req, res) => {
 });
 
 // Delete record
-app.delete('/api/tables/:tableName/:id', async (req, res) => {
+app.delete('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
-  const id = req.params.id;
+  const idOrGuid = req.params.idOrGuid;
   
   if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
     return res.status(400).json({ error: 'Invalid table name' });
   }
   
   try {
-    await pool.query(`DELETE FROM ${tableName} WHERE id = ?`, [id]);
-    res.json({ message: 'Record deleted successfully' });
+    // Try to delete by ID first if the parameter looks like a number
+    let deleteResult;
+    
+    if (!isNaN(idOrGuid)) {
+      console.log(`[${tableName}] Executing DELETE for id: ${idOrGuid}`);
+      [deleteResult] = await pool.query(`DELETE FROM ${tableName} WHERE id = ?`, [idOrGuid]);
+      
+      if (deleteResult.affectedRows > 0) {
+        return res.json({ message: 'Record deleted successfully', identifier: 'id', value: idOrGuid });
+      }
+    }
+    
+    // If no rows affected or not a number, try by GUID
+    console.log(`[${tableName}] Executing DELETE for guid: ${idOrGuid}`);
+    [deleteResult] = await pool.query(`DELETE FROM ${tableName} WHERE guid = ?`, [idOrGuid]);
+    
+    if (deleteResult.affectedRows > 0) {
+      return res.json({ message: 'Record deleted successfully', identifier: 'guid', value: idOrGuid });
+    }
+    
+    // If still no records affected, return 404
+    return res.status(404).json({ error: 'Record not found' });
   } catch (err) {
+    console.error(`[${tableName}] Database error during DELETE:`, err);
     res.status(500).json({ error: err.message });
   }
 });
