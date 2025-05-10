@@ -394,12 +394,12 @@ app.post('/api/tables/:tableName', async (req, res) => {
 // Update record with flexible body handling
 app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
-  const idOrGuid = req.params.idOrGuid;
+  const idOrGuid = req.params.params.idOrGuid; // Corrected access to path parameters
   let data;
-  
+
   try {
     data = extractDataFromRequest(req);
-    
+
     // Validate we got an object
     if (typeof data !== 'object' || data === null) {
       console.error(`[${tableName}] Parsed data for UpdateRecord is not an object:`, data);
@@ -416,71 +416,112 @@ app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
     return res.status(400).json({ error: 'Invalid table name' });
   }
 
-  // Remove ID if present to avoid overwriting the record ID
-  if (data.id !== undefined) {
-    console.log(`[${tableName}] Removing id property from data:`, data.id);
-    delete data.id;
+  // Create a copy of the data to modify for the SET clause
+  const updateData = { ...data };
+
+  // Always remove ID from the update data to prevent primary key modification
+  if (updateData.id !== undefined) {
+    console.log(`[${tableName}] Removing id property from data:`, updateData.id);
+    delete updateData.id;
   }
 
-  // Remove guid if present to avoid overwriting the record guid
-  if (data.guid !== undefined) {
-    console.log(`[${tableName}] Removing guid property from data:`, data.guid);
-    delete data.guid;
+  // Determine if the record is identified by ID (numeric) or GUID (non-numeric) in the URL
+  const isIdentifyingByIdUrl = !isNaN(idOrGuid);
+
+  // Remove guid from the updateData ONLY if the record is being identified by GUID in the URL.
+  // This prevents the user from changing the GUID that was used to find the record *via this specific request*.
+  // If the user updates by ID, they *can* set or update the GUID via the body.
+  if (!isIdentifyingByIdUrl && updateData.guid !== undefined) {
+      console.log(`[${tableName}] Removing guid property from data because update is by guid: ${idOrGuid}`, updateData.guid);
+      delete updateData.guid;
   }
 
-  if (Object.keys(data).length === 0) {
-    console.log(`[${tableName}] No update data provided after processing.`);
-    return res.status(400).json({ error: 'No update data provided or data format is incorrect' });
+  // Check if there's any data left to update after removing id and potentially guid
+  // Only proceed if there are actual fields to update other than the identifiers
+  const finalUpdateKeys = Object.keys(updateData);
+  if (finalUpdateKeys.length === 0) {
+     // Check if the original data had any fields besides id and the identifier field in the URL
+     const originalKeysMinusIdentifier = Object.keys(data).filter(key => {
+        if (key === 'id') return false; // Always exclude id
+        if (!isIdentifyingByIdUrl && key === 'guid') return false; // Exclude guid if identifying by guid
+        return true; // Include other keys that are not the identifier being used
+     });
+
+     if (originalKeysMinusIdentifier.length === 0) {
+         console.log(`[${tableName}] No update data provided after processing (only contained id or identifier field).`);
+         // If the record exists but no updatable data was provided, maybe return success or 400?
+         // Returning 400 is clearer that the payload was insufficient for an update.
+         return res.status(400).json({ error: 'No valid update data provided' });
+     }
+      // If we reached here, it means updateData was empty *but* original data had fields
+      // that *should* have been included. This indicates an issue with the filtering logic
+      // or unexpected data format. Log and return 400.
+      console.error(`[${tableName}] Logic error: updateData is empty but original data had updatable fields.`);
+      return res.status(500).json({ error: 'Internal processing error with update data' });
   }
+
 
   try {
     let queryCondition, queryParams;
-    
-    // Check if idOrGuid is numeric (likely an ID) or string (likely a GUID)
-    if (!isNaN(idOrGuid)) {
-      console.log(`[${tableName}] Executing UPDATE query for id: ${idOrGuid} with data:`, JSON.stringify(data));
+    let updateSuccessful = false;
+
+    // Attempt update by ID or GUID based on idOrGuid from the URL
+    if (isIdentifyingByIdUrl) {
+      console.log(`[${tableName}] Attempting UPDATE by id: ${idOrGuid} with data:`, JSON.stringify(updateData));
       queryCondition = 'id = ?';
-      queryParams = [data, idOrGuid];
+      queryParams = [updateData, idOrGuid];
     } else {
-      console.log(`[${tableName}] Executing UPDATE query for guid: ${idOrGuid} with data:`, JSON.stringify(data));
+      console.log(`[${tableName}] Attempting UPDATE by guid: ${idOrGuid} with data:`, JSON.stringify(updateData));
       queryCondition = 'guid = ?';
-      queryParams = [data, idOrGuid];
+      queryParams = [updateData, idOrGuid];
     }
-    
+
     const [updateResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE ${queryCondition}`, queryParams);
-    
-    if (updateResult.affectedRows === 0) {
-      // If no rows were updated with the first condition, try the other one
-      if (!isNaN(idOrGuid)) {
-        // If we tried ID first, now try GUID
-        console.log(`[${tableName}] No rows updated by id, trying guid: ${idOrGuid}`);
-        const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE guid = ?`, [data, idOrGuid]);
-        if (retryResult.affectedRows === 0) {
-          return res.status(404).json({ error: 'Record not found' });
+
+    if (updateResult.affectedRows > 0) {
+        updateSuccessful = true;
+        console.log(`[${tableName}] Update successful using ${isIdentifyingByIdUrl ? 'id' : 'guid'}: ${idOrGuid}`);
+    } else {
+        // Implement the retry logic from the original code if the initial attempt failed
+        let retryAttempted = false;
+        if (isIdentifyingByIdUrl && idOrGuid.match(/^[0-9a-fA-F-]+$/)) { // Tried ID, but idOrGuid looks like a GUID?
+             console.log(`[${tableName}] No rows updated by id ${idOrGuid}, trying guid...`);
+             queryCondition = 'guid = ?';
+             queryParams = [updateData, idOrGuid]; // Use original idOrGuid for the retry condition
+             [updateResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE ${queryCondition}`, queryParams);
+             retryAttempted = true;
+             if (updateResult.affectedRows > 0) {
+                 updateSuccessful = true;
+                 console.log(`[${tableName}] Update successful via guid after id failed for ${idOrGuid}.`);
+             }
+        } else if (!isIdentifyingByIdUrl && idOrGuid.match(/^\d+$/)) { // Tried GUID, but idOrGuid looks like an ID?
+             console.log(`[${tableName}] No rows updated by guid ${idOrGuid}, trying id...`);
+             queryCondition = 'id = ?';
+             queryParams = [updateData, idOrGuid]; // Use original idOrGuid for the retry condition
+             [updateResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE ${queryCondition}`, queryParams);
+             retryAttempted = true;
+             if (updateResult.affectedRows > 0) {
+                updateSuccessful = true;
+                console.log(`[${tableName}] Update successful via id after guid failed for ${idOrGuid}.`);
+             }
         }
-      } else {
-        // If we tried GUID first, now try ID (if it could potentially be numeric)
-        if (idOrGuid.match(/^\d+$/)) {
-          console.log(`[${tableName}] No rows updated by guid, trying id: ${idOrGuid}`);
-          const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, idOrGuid]);
-          if (retryResult.affectedRows === 0) {
-            return res.status(404).json({ error: 'Record not found' });
-          }
-        } else {
-          return res.status(404).json({ error: 'Record not found' });
+
+        if (!updateSuccessful) {
+           console.log(`[${tableName}] Record not found for update with identifier: ${idOrGuid}`);
+           return res.status(404).json({ error: 'Record not found' });
         }
-      }
     }
-    
-    console.log(`[${tableName}] Update successful for idOrGuid: ${idOrGuid}`);
-    
-    // Fetch the updated record to return it
-    let [updatedRecord] = await pool.query(
-      `SELECT * FROM ${tableName} WHERE id = ? OR guid = ? LIMIT 1`, 
-      [idOrGuid, idOrGuid]
-    );
-    
-    res.json(updatedRecord[0] || { message: 'Record updated successfully' });
+
+    // If update was successful, fetch the updated record using the original identifier logic
+    console.log(`[${tableName}] Fetching updated record with identifier: ${idOrGuid}`);
+    const [fetchedRecords] = await pool.query(`
+      SELECT * FROM ${tableName} WHERE ${!isNaN(idOrGuid) ? 'id' : 'guid'} = ?
+      ${!isNaN(idOrGuid) ? 'OR guid = ?' : ''} LIMIT 1
+    `, !isNaN(idOrGuid) ? [idOrGuid, idOrGuid] : [idOrGuid]);
+
+
+    res.json(fetchedRecords[0] || { message: 'Record updated successfully (could not refetch)' });
+
   } catch (err) {
     console.error(`[${tableName}] Database error during UPDATE:`, err);
     res.status(500).json({ error: err.message });
