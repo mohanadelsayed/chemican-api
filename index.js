@@ -202,7 +202,127 @@ async function checkForNewFormSubmissions() {
     console.error('Error checking for new form submissions:', err);
   }
 }
-// Create record with flexible body handling and foreign key resolution
+
+async function sendWebhookNotification(tableName, recordData) {
+  if (!POWER_AUTOMATE_WEBHOOK_URL) {
+    return;
+  }
+  
+  console.log(`Sending webhook notification for ${tableName} record ID: ${recordData.id}`);
+  
+  try {
+    const notificationPayload = {
+      tableName,
+      recordDetails: recordData
+    };
+    
+    const response = await axios.post(POWER_AUTOMATE_WEBHOOK_URL, notificationPayload, {
+      headers: { 'Content-Type': 'application/json' }
+    });
+    
+    console.log(`Webhook notification sent. Status: ${response.status}`);
+    return true;
+  } catch (error) {
+    console.error(
+      `Failed to send webhook:`,
+      error.response?.status,
+      error.response?.data || error.message
+    );
+    throw error;
+  }
+}
+
+// Helper function to extract data from request body in different formats
+function extractDataFromRequest(req) {
+  // If req.body.body.$ exists as a string (test tab format)
+  if (req.body?.body?.$) {
+    const bodyContent = req.body.body.$;
+    if (typeof bodyContent === 'string') {
+      try {
+        return JSON.parse(bodyContent);
+      } catch (e) {
+        return bodyContent; // Return as is if not valid JSON
+      }
+    } else {
+      return bodyContent; // Maybe it's already an object
+    }
+  } 
+  // Try req.body.body (Power Automate flow format)
+  else if (req.body?.body) {
+    const bodyContent = req.body.body;
+    if (typeof bodyContent === 'string') {
+      try {
+        return JSON.parse(bodyContent);
+      } catch (e) {
+        return bodyContent; // Return as is if not valid JSON
+      }
+    } else {
+      return bodyContent; // Maybe it's already an object
+    }
+  }
+  // Fallback to req.body itself
+  else {
+    return req.body;
+  }
+}
+
+// Test connection endpoint
+app.get('/api/test', async (req, res) => {
+  try {
+    const [results] = await pool.query('SELECT 1+1 AS result');
+    res.json({ message: 'Database connection successful', result: results[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get table data endpoint
+app.get('/api/tables/:tableName', async (req, res) => {
+  const tableName = req.params.tableName;
+  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+    return res.status(400).json({ error: 'Invalid table name' });
+  }
+  
+  try {
+    const [results] = await pool.query(`SELECT * FROM ${tableName}`);
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get specific record by ID or GUID
+app.get('/api/tables/:tableName/:idOrGuid', async (req, res) => {
+  const tableName = req.params.tableName;
+  const idOrGuid = req.params.idOrGuid;
+  
+  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+    return res.status(400).json({ error: 'Invalid table name' });
+  }
+  
+  try {
+    // First, try to find by id (assuming id is numeric)
+    let results;
+    
+    if (!isNaN(idOrGuid)) {
+      // If the parameter is numeric, try to find by id first
+      [results] = await pool.query(`SELECT * FROM ${tableName} WHERE id = ?`, [idOrGuid]);
+      
+      if (results.length > 0) {
+        return res.json(results[0]);
+      }
+    }
+    
+    // If not found by id or the parameter is not numeric, try to find by guid
+    [results] = await pool.query(`SELECT * FROM ${tableName} WHERE guid = ?`, [idOrGuid]);
+    
+    res.json(results[0] || {});
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create record with flexible body handling
 app.post('/api/tables/:tableName', async (req, res) => {
   const tableName = req.params.tableName;
   let data;
@@ -238,11 +358,8 @@ app.post('/api/tables/:tableName', async (req, res) => {
   }
 
   try {
-    // Handle foreign key references that might be using GUIDs instead of IDs
-    const processedData = await processForeignKeyReferences(tableName, data);
-    
-    console.log(`[${tableName}] Executing INSERT query with processed data:`, JSON.stringify(processedData));
-    const [result] = await pool.query(`INSERT INTO ${tableName} SET ?`, processedData);
+    console.log(`[${tableName}] Executing INSERT query with data:`, JSON.stringify(data));
+    const [result] = await pool.query(`INSERT INTO ${tableName} SET ?`, data);
     const newRecordId = result.insertId;
     console.log(`[${tableName}] Insert successful, new id: ${newRecordId}`);
 
@@ -261,28 +378,20 @@ app.post('/api/tables/:tableName', async (req, res) => {
     // Send webhook notification for all tables
     if (POWER_AUTOMATE_WEBHOOK_URL) {
       try {
-        await sendWebhookNotification(tableName, { id: newRecordId, ...processedData });
+        await sendWebhookNotification(tableName, { id: newRecordId, ...data });
       } catch (error) {
         console.error(`[${tableName}] Failed to send webhook notification, but will continue.`);
       }
     }
 
-    res.json({ id: newRecordId, ...processedData });
+    res.json({ id: newRecordId, ...data });
   } catch (err) {
     console.error(`[${tableName}] Database error during INSERT:`, err);
-    // Provide more specific error message for foreign key constraint violations
-    if (err.code === 'ER_NO_REFERENCED_ROW_2') {
-      res.status(400).json({ 
-        error: 'Foreign key constraint violation. One or more referenced records do not exist.',
-        details: err.message
-      });
-    } else {
-      res.status(500).json({ error: err.message });
-    }
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Update record with flexible body handling and foreign key resolution
+// Update record with flexible body handling
 app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
   const idOrGuid = req.params.idOrGuid;
@@ -325,20 +434,17 @@ app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   }
 
   try {
-    // Process any foreign key references that might be GUIDs
-    const processedData = await processForeignKeyReferences(tableName, data);
-    
     let queryCondition, queryParams;
     
     // Check if idOrGuid is numeric (likely an ID) or string (likely a GUID)
     if (!isNaN(idOrGuid)) {
-      console.log(`[${tableName}] Executing UPDATE query for id: ${idOrGuid} with processed data:`, JSON.stringify(processedData));
+      console.log(`[${tableName}] Executing UPDATE query for id: ${idOrGuid} with data:`, JSON.stringify(data));
       queryCondition = 'id = ?';
-      queryParams = [processedData, idOrGuid];
+      queryParams = [data, idOrGuid];
     } else {
-      console.log(`[${tableName}] Executing UPDATE query for guid: ${idOrGuid} with processed data:`, JSON.stringify(processedData));
+      console.log(`[${tableName}] Executing UPDATE query for guid: ${idOrGuid} with data:`, JSON.stringify(data));
       queryCondition = 'guid = ?';
-      queryParams = [processedData, idOrGuid];
+      queryParams = [data, idOrGuid];
     }
     
     const [updateResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE ${queryCondition}`, queryParams);
@@ -348,7 +454,7 @@ app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
       if (!isNaN(idOrGuid)) {
         // If we tried ID first, now try GUID
         console.log(`[${tableName}] No rows updated by id, trying guid: ${idOrGuid}`);
-        const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE guid = ?`, [processedData, idOrGuid]);
+        const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE guid = ?`, [data, idOrGuid]);
         if (retryResult.affectedRows === 0) {
           return res.status(404).json({ error: 'Record not found' });
         }
@@ -356,7 +462,7 @@ app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
         // If we tried GUID first, now try ID (if it could potentially be numeric)
         if (idOrGuid.match(/^\d+$/)) {
           console.log(`[${tableName}] No rows updated by guid, trying id: ${idOrGuid}`);
-          const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [processedData, idOrGuid]);
+          const [retryResult] = await pool.query(`UPDATE ${tableName} SET ? WHERE id = ?`, [data, idOrGuid]);
           if (retryResult.affectedRows === 0) {
             return res.status(404).json({ error: 'Record not found' });
           }
@@ -377,19 +483,11 @@ app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
     res.json(updatedRecord[0] || { message: 'Record updated successfully' });
   } catch (err) {
     console.error(`[${tableName}] Database error during UPDATE:`, err);
-    // Provide more specific error message for foreign key constraint violations
-    if (err.code === 'ER_NO_REFERENCED_ROW_2') {
-      res.status(400).json({ 
-        error: 'Foreign key constraint violation. One or more referenced records do not exist.',
-        details: err.message
-      });
-    } else {
-      res.status(500).json({ error: err.message });
-    }
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Delete record - augmented with foreign key handling
+// Delete record
 app.delete('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
   const idOrGuid = req.params.idOrGuid;
@@ -413,27 +511,10 @@ app.delete('/api/tables/:tableName/:idOrGuid', async (req, res) => {
     
     // If no rows affected or not a number, try by GUID
     console.log(`[${tableName}] Executing DELETE for guid: ${idOrGuid}`);
+    [deleteResult] = await pool.query(`DELETE FROM ${tableName} WHERE guid = ?`, [idOrGuid]);
     
-    // For GUID deletion, we need to find the numeric ID first if the table has foreign key relationships
-    // Get the ID first using the GUID, then delete using the ID
-    const [rows] = await pool.query(`SELECT id FROM ${tableName} WHERE guid = ?`, [idOrGuid]);
-    
-    if (rows.length > 0) {
-      const numericId = rows[0].id;
-      console.log(`[${tableName}] Found record with guid: ${idOrGuid}, deleting with id: ${numericId}`);
-      [deleteResult] = await pool.query(`DELETE FROM ${tableName} WHERE id = ?`, [numericId]);
-      
-      if (deleteResult.affectedRows > 0) {
-        return res.json({ 
-          message: 'Record deleted successfully', 
-          identifier: 'guid', 
-          value: idOrGuid,
-          id: numericId 
-        });
-      }
-    } else {
-      // If we couldn't find by GUID, return 404
-      return res.status(404).json({ error: 'Record not found' });
+    if (deleteResult.affectedRows > 0) {
+      return res.json({ message: 'Record deleted successfully', identifier: 'guid', value: idOrGuid });
     }
     
     // If still no records affected, return 404
@@ -444,99 +525,109 @@ app.delete('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   }
 });
 
-// New function to process foreign key references in data objects
-async function processForeignKeyReferences(tableName, data) {
-  // Clone the data to avoid modifying the original
-  const processedData = { ...data };
-  
+// Get current tracking state
+app.get('/api/tracking-status', async (req, res) => {
   try {
-    // Get the table structure to identify foreign key fields
-    const [tableInfo] = await pool.query(`
-      SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
-      FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-      WHERE TABLE_NAME = ?
-      AND REFERENCED_TABLE_NAME IS NOT NULL
-      AND CONSTRAINT_SCHEMA = DATABASE()
-    `, [tableName]);
+    const [trackingInfo] = await pool.query(`
+      SELECT * FROM webhook_processed_records
+    `);
     
-    // No foreign keys to process
-    if (tableInfo.length === 0) {
-      return processedData;
-    }
-    
-    console.log(`[${tableName}] Found ${tableInfo.length} foreign key fields to process`);
-    
-    // Process each foreign key field
-    for (const fkInfo of tableInfo) {
-      const fieldName = fkInfo.COLUMN_NAME;
-      const referencedTable = fkInfo.REFERENCED_TABLE_NAME;
-      const referencedColumn = fkInfo.REFERENCED_COLUMN_NAME;
-      
-      // If this foreign key field exists in the data and has a value
-      if (processedData[fieldName] !== undefined && processedData[fieldName] !== null) {
-        const fieldValue = processedData[fieldName];
-        
-        // If the value is not a number, it might be a GUID - try to resolve it
-        if (isNaN(fieldValue) && typeof fieldValue === 'string') {
-          console.log(`[${tableName}] Resolving foreign key ${fieldName} with GUID value: ${fieldValue}`);
-          
-          // Look up the numeric ID from the referenced table using the GUID
-          const [refRows] = await pool.query(
-            `SELECT ${referencedColumn} FROM ${referencedTable} WHERE guid = ?`, 
-            [fieldValue]
-          );
-          
-          if (refRows.length > 0) {
-            const numericId = refRows[0][referencedColumn];
-            console.log(`[${tableName}] Resolved foreign key ${fieldName} GUID ${fieldValue} to ID ${numericId}`);
-            processedData[fieldName] = numericId;
-          } else {
-            console.error(`[${tableName}] Failed to resolve foreign key ${fieldName} GUID ${fieldValue}`);
-            throw new Error(`Referenced record with GUID ${fieldValue} not found in ${referencedTable}`);
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[${tableName}] Error processing foreign keys:`, error);
-    throw error;
+    res.json({
+      trackingRecords: trackingInfo,
+      inMemoryLastId: lastKnownFormSubmitId,
+      isInitialCheckComplete
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-  
-  return processedData;
-}
+});
 
-// Helper function to get database table schema information
-async function getTableSchema(tableName) {
+// Reset tracking for a table
+app.post('/api/reset-tracking/:tableName', async (req, res) => {
   try {
-    const [columns] = await pool.query(`
-      SELECT 
-        COLUMN_NAME, 
-        DATA_TYPE, 
-        IS_NULLABLE,
-        COLUMN_KEY
-      FROM 
-        INFORMATION_SCHEMA.COLUMNS 
-      WHERE 
-        TABLE_NAME = ? 
-        AND TABLE_SCHEMA = DATABASE()
-    `, [tableName]);
+    const tableName = req.params.tableName;
+    if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+      return res.status(400).json({ error: 'Invalid table name' });
+    }
     
-    const [foreignKeys] = await pool.query(`
-      SELECT 
-        COLUMN_NAME,
-        REFERENCED_TABLE_NAME,
-        REFERENCED_COLUMN_NAME
-      FROM 
-        INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-      WHERE 
-        TABLE_NAME = ?
-        AND REFERENCED_TABLE_NAME IS NOT NULL
-        AND CONSTRAINT_SCHEMA = DATABASE()
-    `, [tableName]);
+    // Reset to specified ID or find current max
+    let resetToId = req.body.resetToId;
     
-    return { columns, foreignKeys };
-  } catch (error) {
-    console.error(`Error fetching schema for ${tableName}:`, error);
-    throw error;
+    if (resetToId === undefined) {
+      // Reset to current max ID
+      const [maxRows] = await pool.query(`
+        SELECT COALESCE(MAX(id), 0) AS max_id FROM ${tableName}
+      `);
+      resetToId = maxRows[0].max_id || 0;
+    }
+    
+    // Update the tracking table
+    await pool.query(`
+      UPDATE webhook_processed_records
+      SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
+      WHERE table_name = ?
+    `, [resetToId, tableName]);
+    
+    // Update in-memory variable if it's form_submits
+    if (tableName === 'form_submits') {
+      lastKnownFormSubmitId = resetToId;
+    }
+    
+    res.json({ 
+      message: `Tracking for ${tableName} reset to ID ${resetToId}`,
+      resetToId
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
-}
+});
+
+// Health check endpoint for monitoring
+app.get('/health', async (req, res) => {
+  try {
+    // Check database connection
+    await pool.query('SELECT 1');
+    
+    // Return current tracking state
+    const [trackingInfo] = await pool.query(`
+      SELECT * FROM webhook_processed_records
+      WHERE table_name = 'form_submits'
+    `);
+    
+    res.json({
+      status: 'healthy',
+      lastProcessedId: lastKnownFormSubmitId,
+      isInitialCheckComplete,
+      trackingInfo: trackingInfo[0] || null,
+      webhookUrl: POWER_AUTOMATE_WEBHOOK_URL ? '(configured)' : '(not configured)'
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: err.message
+    });
+  }
+});
+
+// Force check for new submissions (for testing)
+app.post('/api/force-check', async (req, res) => {
+  try {
+    await checkForNewFormSubmissions();
+    res.json({
+      status: 'check initiated',
+      lastProcessedId: lastKnownFormSubmitId
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Initialize the database and start the server
+initializeDatabase().then(() => {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}).catch(err => {
+  console.error('Failed to initialize application:', err);
+  process.exit(1);
+});
