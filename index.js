@@ -291,17 +291,31 @@ app.get('/api/tables/:tableName', async (req, res) => {
   }
 });
 
-// Get specific record
-app.get('/api/tables/:tableName/:id', async (req, res) => {
+// Get specific record by ID or GUID
+app.get('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
-  const id = req.params.id;
+  const idOrGuid = req.params.idOrGuid;
   
   if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
     return res.status(400).json({ error: 'Invalid table name' });
   }
   
   try {
-    const [results] = await pool.query(`SELECT * FROM ${tableName} WHERE id = ?`, [id]);
+    // First, try to find by id (assuming id is numeric)
+    let results;
+    
+    if (!isNaN(idOrGuid)) {
+      // If the parameter is numeric, try to find by id first
+      [results] = await pool.query(`SELECT * FROM ${tableName} WHERE id = ?`, [idOrGuid]);
+      
+      if (results.length > 0) {
+        return res.json(results[0]);
+      }
+    }
+    
+    // If not found by id or the parameter is not numeric, try to find by guid
+    [results] = await pool.query(`SELECT * FROM ${tableName} WHERE guid = ?`, [idOrGuid]);
+    
     res.json(results[0] || {});
   } catch (err) {
     res.status(500).json({ error: err.message });
