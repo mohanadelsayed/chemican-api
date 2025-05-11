@@ -28,6 +28,8 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // Create database connection pool
 let pool;
 let lastKnownFormSubmitId = 0;
+let lastKnownSubscriberId = 0;
+let lastKnownBlogPostsState = {}; // To track view_count changes
 let isInitialCheckComplete = false;
 
 async function initializeDatabase() {
@@ -50,12 +52,12 @@ async function initializeDatabase() {
     // Create tracking table for external submissions if needed
     await createTrackingTable();
     
-    // Initialize the lastKnownFormSubmitId
-    await initializeLastKnownId();
+    // Initialize the lastKnownIds for various tables
+    await initializeLastKnownIds();
     
-    // Start polling for new external form submissions
+    // Start polling for new records in monitored tables
     if (POWER_AUTOMATE_WEBHOOK_URL) {
-      startFormSubmissionPolling();
+      startRecordPolling();
     }
     
   } catch (err) {
@@ -75,10 +77,13 @@ async function createTrackingTable() {
       )
     `);
     
-    // Insert a row for form_submits if it doesn't exist
+    // Insert rows for monitored tables if they don't exist
     await pool.query(`
       INSERT IGNORE INTO webhook_processed_records (table_name, last_processed_id)
-      VALUES ('form_submits', 0)
+      VALUES 
+        ('form_submits', 0),
+        ('subscribers', 0),
+        ('blog_posts', 0)
     `);
     
     console.log('Tracking table created successfully');
@@ -87,54 +92,131 @@ async function createTrackingTable() {
   }
 }
 
-async function initializeLastKnownId() {
+async function initializeLastKnownIds() {
   try {
-    // Get the last processed ID from the tracking table
+    // Get the last processed IDs from the tracking table for all monitored tables
     const [rows] = await pool.query(`
-      SELECT last_processed_id FROM webhook_processed_records
-      WHERE table_name = 'form_submits'
+      SELECT table_name, last_processed_id FROM webhook_processed_records
+      WHERE table_name IN ('form_submits', 'subscribers', 'blog_posts')
     `);
     
-    if (rows.length > 0) {
-      lastKnownFormSubmitId = rows[0].last_processed_id;
-      console.log(`Initialized lastKnownFormSubmitId to ${lastKnownFormSubmitId}`);
-    } else {
-      // If no record exists, find the highest existing ID
-      const [maxRows] = await pool.query(`
-        SELECT COALESCE(MAX(id), 0) AS max_id FROM form_submits
-      `);
+    // Process each table's tracking info
+    for (const row of rows) {
+      const tableName = row.table_name;
+      const lastProcessedId = row.last_processed_id;
       
-      lastKnownFormSubmitId = maxRows[0].max_id || 0;
-      console.log(`No tracking record found. Set lastKnownFormSubmitId to current max: ${lastKnownFormSubmitId}`);
+      if (tableName === 'form_submits') {
+        lastKnownFormSubmitId = lastProcessedId;
+        console.log(`Initialized lastKnownFormSubmitId to ${lastKnownFormSubmitId}`);
+      }
+      else if (tableName === 'subscribers') {
+        lastKnownSubscriberId = lastProcessedId;
+        console.log(`Initialized lastKnownSubscriberId to ${lastKnownSubscriberId}`);
+      }
       
-      // Update the tracking table
-      await pool.query(`
-        INSERT INTO webhook_processed_records (table_name, last_processed_id)
-        VALUES ('form_submits', ?)
-        ON DUPLICATE KEY UPDATE last_processed_id = ?
-      `, [lastKnownFormSubmitId, lastKnownFormSubmitId]);
+      // For tables where we need to track specific column changes (like blog_posts)
+      if (tableName === 'blog_posts') {
+        // Initialize the state of blog_posts view_count for tracking changes
+        await initializeBlogPostsState();
+      }
+    }
+    
+    // For any table without an existing row, find the highest existing ID
+    if (!rows.find(r => r.table_name === 'form_submits')) {
+      await initializeTableMaxId('form_submits', 'lastKnownFormSubmitId');
+    }
+    
+    if (!rows.find(r => r.table_name === 'subscribers')) {
+      await initializeTableMaxId('subscribers', 'lastKnownSubscriberId');
+    }
+    
+    if (!rows.find(r => r.table_name === 'blog_posts')) {
+      await initializeTableMaxId('blog_posts');
+      await initializeBlogPostsState();
     }
     
     // Mark that we've completed the initial check and setup
     isInitialCheckComplete = true;
   } catch (err) {
-    console.error('Error initializing lastKnownFormSubmitId:', err);
+    console.error('Error initializing lastKnownIds:', err);
   }
 }
 
-function startFormSubmissionPolling() {
-  // First immediate check
-  checkForNewFormSubmissions();
-  
-  // Then check every 10 seconds
-  setInterval(checkForNewFormSubmissions, 10000);
+async function initializeTableMaxId(tableName, variableName = null) {
+  try {
+    // Find the highest existing ID
+    const [maxRows] = await pool.query(`
+      SELECT COALESCE(MAX(id), 0) AS max_id FROM ${tableName}
+    `);
+    
+    const maxId = maxRows[0].max_id || 0;
+    
+    // Set the variable if provided
+    if (variableName) {
+      global[variableName] = maxId;
+      console.log(`No tracking record found for ${tableName}. Set ${variableName} to current max: ${maxId}`);
+    } else {
+      console.log(`No tracking record found for ${tableName}. Set max ID to: ${maxId}`);
+    }
+    
+    // Update the tracking table
+    await pool.query(`
+      INSERT INTO webhook_processed_records (table_name, last_processed_id)
+      VALUES (?, ?)
+      ON DUPLICATE KEY UPDATE last_processed_id = ?
+    `, [tableName, maxId, maxId]);
+    
+    return maxId;
+  } catch (err) {
+    console.error(`Error initializing max ID for ${tableName}:`, err);
+    return 0;
+  }
 }
 
-async function checkForNewFormSubmissions() {
+async function initializeBlogPostsState() {
+  try {
+    // Get current state of all blog posts view_counts
+    const [posts] = await pool.query(`
+      SELECT id, view_count FROM blog_posts
+    `);
+    
+    // Store in our tracking object
+    lastKnownBlogPostsState = {};
+    posts.forEach(post => {
+      lastKnownBlogPostsState[post.id] = post.view_count;
+    });
+    
+    console.log(`Initialized state for ${posts.length} blog posts`);
+  } catch (err) {
+    console.error('Error initializing blog posts state:', err);
+    lastKnownBlogPostsState = {};
+  }
+}
+
+function startRecordPolling() {
+  // First immediate check
+  checkForNewRecords();
+  
+  // Then check every 10 seconds
+  setInterval(checkForNewRecords, 10000);
+}
+
+async function checkForNewRecords() {
   if (!POWER_AUTOMATE_WEBHOOK_URL || !isInitialCheckComplete) {
     return;
   }
   
+  try {
+    // Check for new records in each monitored table
+    await checkForNewFormSubmissions();
+    await checkForNewSubscribers();
+    await checkForBlogPostViewCountChanges();
+  } catch (err) {
+    console.error('Error during record polling:', err);
+  }
+}
+
+async function checkForNewFormSubmissions() {
   try {
     // Get current tracked ID from database to ensure we're using the latest value
     const [trackingRow] = await pool.query(`
@@ -196,10 +278,145 @@ async function checkForNewFormSubmissions() {
         WHERE table_name = 'form_submits'
       `, [highestProcessedId]);
       
-      console.log(`Updated last processed ID to ${highestProcessedId}`);
+      console.log(`Updated form_submits last processed ID to ${highestProcessedId}`);
     }
   } catch (err) {
     console.error('Error checking for new form submissions:', err);
+  }
+}
+
+async function checkForNewSubscribers() {
+  try {
+    // Get current tracked ID from database to ensure we're using the latest value
+    const [trackingRow] = await pool.query(`
+      SELECT last_processed_id FROM webhook_processed_records
+      WHERE table_name = 'subscribers'
+    `);
+    
+    if (trackingRow.length === 0) {
+      console.error('No tracking record found for subscribers');
+      return;
+    }
+    
+    const currentTrackedId = trackingRow[0].last_processed_id;
+    
+    // Check for new subscribers with ID greater than the tracked ID
+    const [newSubscribers] = await pool.query(`
+      SELECT * FROM subscribers
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT 50
+    `, [currentTrackedId]);
+    
+    if (newSubscribers.length === 0) {
+      return;
+    }
+    
+    console.log(`Found ${newSubscribers.length} new subscribers to process (IDs > ${currentTrackedId})`);
+    
+    let highestProcessedId = currentTrackedId;
+    
+    for (const subscriber of newSubscribers) {
+      try {
+        if (subscriber.id > highestProcessedId) {
+          // Send the webhook notification
+          await sendWebhookNotification('subscribers', subscriber);
+          
+          // Update our tracking variable
+          highestProcessedId = subscriber.id;
+          
+          console.log(`Successfully processed subscriber ID: ${subscriber.id}`);
+        } else {
+          console.log(`Skipping already processed subscriber ID: ${subscriber.id}`);
+        }
+      } catch (err) {
+        console.error(`Failed to process subscriber ID ${subscriber.id}:`, err);
+        // Continue with next subscriber even if this one fails
+      }
+    }
+    
+    // Only update the database if we actually processed new records
+    if (highestProcessedId > currentTrackedId) {
+      // Update our in-memory tracking
+      lastKnownSubscriberId = highestProcessedId;
+      
+      // Update the tracking table after processing all subscribers
+      await pool.query(`
+        UPDATE webhook_processed_records
+        SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
+        WHERE table_name = 'subscribers'
+      `, [highestProcessedId]);
+      
+      console.log(`Updated subscribers last processed ID to ${highestProcessedId}`);
+    }
+  } catch (err) {
+    console.error('Error checking for new subscribers:', err);
+  }
+}
+
+async function checkForBlogPostViewCountChanges() {
+  try {
+    // Get all current blog posts with their view counts
+    const [currentPosts] = await pool.query(`
+      SELECT id, view_count FROM blog_posts
+    `);
+    
+    const postsWithChangedViewCount = [];
+    
+    // Check for changes in view_count
+    for (const post of currentPosts) {
+      const previousViewCount = lastKnownBlogPostsState[post.id];
+      
+      // If this is a new post or the view_count has changed
+      if (previousViewCount === undefined || previousViewCount !== post.view_count) {
+        // Get full post details for the webhook
+        const [fullPostDetails] = await pool.query(`
+          SELECT * FROM blog_posts WHERE id = ?
+        `, [post.id]);
+        
+        if (fullPostDetails.length > 0) {
+          // Add change information
+          const postWithChange = fullPostDetails[0];
+          postWithChange._change_details = {
+            previous_view_count: previousViewCount === undefined ? 0 : previousViewCount,
+            new_view_count: post.view_count,
+            difference: previousViewCount === undefined ? post.view_count : post.view_count - previousViewCount
+          };
+          
+          postsWithChangedViewCount.push(postWithChange);
+          
+          // Update our tracking state
+          lastKnownBlogPostsState[post.id] = post.view_count;
+        }
+      }
+    }
+    
+    if (postsWithChangedViewCount.length === 0) {
+      return;
+    }
+    
+    console.log(`Found ${postsWithChangedViewCount.length} blog posts with changed view_count to process`);
+    
+    // Send webhook notifications for each changed post
+    for (const post of postsWithChangedViewCount) {
+      try {
+        await sendWebhookNotification('blog_posts_view_count_change', post);
+        console.log(`Successfully processed blog post ID: ${post.id} view_count change to ${post.view_count}`);
+      } catch (err) {
+        console.error(`Failed to process blog post ID ${post.id} view_count change:`, err);
+      }
+    }
+    
+    // Update the tracking table with current timestamp to show we checked
+    const highestBlogPostId = Math.max(...currentPosts.map(post => post.id), 0);
+    await pool.query(`
+      UPDATE webhook_processed_records
+      SET last_check_time = CURRENT_TIMESTAMP, last_processed_id = ?
+      WHERE table_name = 'blog_posts'
+    `, [highestBlogPostId]);
+    
+  } catch (err) {
+    console.error('Error checking for blog post view_count changes:', err);
   }
 }
 
@@ -265,7 +482,6 @@ function extractDataFromRequest(req) {
     return req.body;
   }
 }
-
 // Test connection endpoint
 app.get('/api/test', async (req, res) => {
   try {
