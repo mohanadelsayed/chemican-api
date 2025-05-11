@@ -376,13 +376,13 @@ app.post('/api/tables/:tableName', async (req, res) => {
     }
 
     // Send webhook notification for all tables
-    if (POWER_AUTOMATE_WEBHOOK_URL) {
-      try {
-        await sendWebhookNotification(tableName, { id: newRecordId, ...data });
-      } catch (error) {
-        console.error(`[${tableName}] Failed to send webhook notification, but will continue.`);
-      }
-    }
+    // if (POWER_AUTOMATE_WEBHOOK_URL) {
+    //   try {
+    //     await sendWebhookNotification(tableName, { id: newRecordId, ...data });
+    //   } catch (error) {
+    //     console.error(`[${tableName}] Failed to send webhook notification, but will continue.`);
+    //   }
+    // }
 
     res.json({ id: newRecordId, ...data });
   } catch (err) {
