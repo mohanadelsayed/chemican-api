@@ -29,6 +29,7 @@ app.use(bodyParser.urlencoded({ extended: true }));
 let pool;
 let lastKnownFormSubmitId = 0;
 let lastKnownSubscriberId = 0;
+let lastKnownBlogCommentId = 0;
 let lastKnownBlogPostsState = {}; // To track view_count changes
 let isInitialCheckComplete = false;
 
@@ -83,7 +84,8 @@ async function createTrackingTable() {
       VALUES 
         ('form_submits', 0),
         ('subscribers', 0),
-        ('blog_posts', 0)
+        ('blog_posts', 0),
+        ('blog_comments', 0)
     `);
     
     console.log('Tracking table created successfully');
@@ -97,7 +99,7 @@ async function initializeLastKnownIds() {
     // Get the last processed IDs from the tracking table for all monitored tables
     const [rows] = await pool.query(`
       SELECT table_name, last_processed_id FROM webhook_processed_records
-      WHERE table_name IN ('form_submits', 'subscribers', 'blog_posts')
+      WHERE table_name IN ('form_submits', 'subscribers', 'blog_posts', 'blog_comments')
     `);
     
     // Process each table's tracking info
@@ -112,6 +114,10 @@ async function initializeLastKnownIds() {
       else if (tableName === 'subscribers') {
         lastKnownSubscriberId = lastProcessedId;
         console.log(`Initialized lastKnownSubscriberId to ${lastKnownSubscriberId}`);
+      }
+      else if (tableName === 'blog_comments') {
+        lastKnownBlogCommentId = lastProcessedId;
+        console.log(`Initialized lastKnownBlogCommentId to ${lastKnownBlogCommentId}`);
       }
       
       // For tables where we need to track specific column changes (like blog_posts)
@@ -128,6 +134,10 @@ async function initializeLastKnownIds() {
     
     if (!rows.find(r => r.table_name === 'subscribers')) {
       await initializeTableMaxId('subscribers', 'lastKnownSubscriberId');
+    }
+    
+    if (!rows.find(r => r.table_name === 'blog_comments')) {
+      await initializeTableMaxId('blog_comments', 'lastKnownBlogCommentId');
     }
     
     if (!rows.find(r => r.table_name === 'blog_posts')) {
@@ -210,6 +220,7 @@ async function checkForNewRecords() {
     // Check for new records in each monitored table
     await checkForNewFormSubmissions();
     await checkForNewSubscribers();
+    await checkForNewBlogComments();
     await checkForBlogPostViewCountChanges();
   } catch (err) {
     console.error('Error during record polling:', err);
@@ -354,6 +365,75 @@ async function checkForNewSubscribers() {
   }
 }
 
+async function checkForNewBlogComments() {
+  try {
+    // Get current tracked ID from database to ensure we're using the latest value
+    const [trackingRow] = await pool.query(`
+      SELECT last_processed_id FROM webhook_processed_records
+      WHERE table_name = 'blog_comments'
+    `);
+    
+    if (trackingRow.length === 0) {
+      console.error('No tracking record found for blog_comments');
+      return;
+    }
+    
+    const currentTrackedId = trackingRow[0].last_processed_id;
+    
+    // Check for new blog comments with ID greater than the tracked ID
+    const [newComments] = await pool.query(`
+      SELECT * FROM blog_comments
+      WHERE id > ?
+      ORDER BY id ASC
+      LIMIT 50
+    `, [currentTrackedId]);
+    
+    if (newComments.length === 0) {
+      return;
+    }
+    
+    console.log(`Found ${newComments.length} new blog comments to process (IDs > ${currentTrackedId})`);
+    
+    let highestProcessedId = currentTrackedId;
+    
+    for (const comment of newComments) {
+      try {
+        if (comment.id > highestProcessedId) {
+          // Send the webhook notification
+          await sendWebhookNotification('blog_comments', comment);
+          
+          // Update our tracking variable
+          highestProcessedId = comment.id;
+          
+          console.log(`Successfully processed blog comment ID: ${comment.id}`);
+        } else {
+          console.log(`Skipping already processed blog comment ID: ${comment.id}`);
+        }
+      } catch (err) {
+        console.error(`Failed to process blog comment ID ${comment.id}:`, err);
+        // Continue with next comment even if this one fails
+      }
+    }
+    
+    // Only update the database if we actually processed new records
+    if (highestProcessedId > currentTrackedId) {
+      // Update our in-memory tracking
+      lastKnownBlogCommentId = highestProcessedId;
+      
+      // Update the tracking table after processing all comments
+      await pool.query(`
+        UPDATE webhook_processed_records
+        SET last_processed_id = ?, last_check_time = CURRENT_TIMESTAMP
+        WHERE table_name = 'blog_comments'
+      `, [highestProcessedId]);
+      
+      console.log(`Updated blog_comments last processed ID to ${highestProcessedId}`);
+    }
+  } catch (err) {
+    console.error('Error checking for new blog comments:', err);
+  }
+}
+
 async function checkForBlogPostViewCountChanges() {
   try {
     // Get all current blog posts with their view counts
@@ -482,6 +562,16 @@ function extractDataFromRequest(req) {
     return req.body;
   }
 }
+// Test connection endpoint
+app.get('/api/test', async (req, res) => {
+  try {
+    const [results] = await pool.query('SELECT 1+1 AS result');
+    res.json({ message: 'Database connection successful', result: results[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Test connection endpoint
 app.get('/api/test', async (req, res) => {
   try {
