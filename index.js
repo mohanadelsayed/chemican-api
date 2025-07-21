@@ -15,7 +15,7 @@ const MYSQL_DATABASE = process.env.MYSQL_DATABASE;
 const MYSQL_PORT = process.env.MYSQL_PORT;
 const POWER_AUTOMATE_WEBHOOK_URL = process.env.POWER_AUTOMATE_WEBHOOK_URL;
 
-// Check if the webhook URL is set
+// Check if the webhook  URL is set
 if (!POWER_AUTOMATE_WEBHOOK_URL) {
     console.warn("POWER_AUTOMATE_WEBHOOK_URL environment variable is not set. New record notifications to Power Automate will be disabled.");
 }
