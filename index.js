@@ -816,6 +816,40 @@ app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   }
 });
 
+// Delete by multiple field conditions (for junction tables with composite PKs)
+// e.g. DELETE /api/tables/blog_post_tags/where?post_id=76&tag_id=5
+app.delete('/api/tables/:tableName/where', async (req, res) => {
+  const tableName = req.params.tableName;
+  const conditions = req.query;
+
+  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+    return res.status(400).json({ error: 'Invalid table name' });
+  }
+
+  const fields = Object.keys(conditions);
+  if (fields.length === 0) {
+    return res.status(400).json({ error: 'At least one query parameter is required' });
+  }
+  if (fields.some(f => !/^[a-zA-Z0-9_]+$/.test(f))) {
+    return res.status(400).json({ error: 'Invalid field name' });
+  }
+
+  try {
+    const whereClauses = fields.map(f => `\`${f}\` = ?`).join(' AND ');
+    const values = fields.map(f => conditions[f]);
+    console.log(`[${tableName}] Executing DELETE WHERE ${whereClauses}`, values);
+    const [deleteResult] = await pool.query(`DELETE FROM ${tableName} WHERE ${whereClauses}`, values);
+
+    if (deleteResult.affectedRows > 0) {
+      return res.json({ message: 'Record(s) deleted successfully', affectedRows: deleteResult.affectedRows });
+    }
+    return res.status(404).json({ error: 'No matching records found' });
+  } catch (err) {
+    console.error(`[${tableName}] Database error during DELETE WHERE:`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Delete record
 app.delete('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
