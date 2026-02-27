@@ -504,28 +504,30 @@ async function sendWebhookNotification(tableName, recordData) {
   if (!POWER_AUTOMATE_WEBHOOK_URL) {
     return;
   }
-  
+
   console.log(`Sending webhook notification for ${tableName} record ID: ${recordData.id}`);
-  
+
   try {
     const notificationPayload = {
       tableName,
       recordDetails: recordData
     };
-    
+
     const response = await axios.post(POWER_AUTOMATE_WEBHOOK_URL, notificationPayload, {
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 10000
     });
-    
+
     console.log(`Webhook notification sent. Status: ${response.status}`);
     return true;
   } catch (error) {
-    console.error(
-      `Failed to send webhook:`,
-      error.response?.status,
-      error.response?.data || error.message
+    // Log but don't throw — webhook failures should not break the polling loop
+    console.warn(
+      `Webhook notification failed (non-blocking):`,
+      error.response?.status || error.code,
+      error.response?.statusText || error.message
     );
-    throw error;
+    return false;
   }
 }
 
