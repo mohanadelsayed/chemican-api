@@ -599,6 +599,30 @@ app.get('/api/tables/:tableName', async (req, res) => {
   }
 });
 
+// Search records by field value (e.g. GET /api/tables/blog_posts/search?field=slug&value=my-post)
+app.get('/api/tables/:tableName/search', async (req, res) => {
+  const tableName = req.params.tableName;
+  const { field, value } = req.query;
+
+  if (!/^[a-zA-Z0-9_]+$/.test(tableName)) {
+    return res.status(400).json({ error: 'Invalid table name' });
+  }
+  if (!field || !value) {
+    return res.status(400).json({ error: 'Both field and value query params are required' });
+  }
+  if (!/^[a-zA-Z0-9_]+$/.test(field)) {
+    return res.status(400).json({ error: 'Invalid field name' });
+  }
+
+  try {
+    const [results] = await pool.query(`SELECT * FROM ${tableName} WHERE ?? = ? LIMIT 1`, [field, value]);
+    res.json(results[0] || null);
+  } catch (err) {
+    console.error(`[${tableName}] Search error:`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get specific record by ID or GUID
 app.get('/api/tables/:tableName/:idOrGuid', async (req, res) => {
   const tableName = req.params.tableName;
