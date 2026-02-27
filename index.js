@@ -928,6 +928,58 @@ app.post('/api/force-check', async (req, res) => {
   }
 });
 
+// ============================================================
+// EMAIL NOTIFICATIONS (via nodemailer)
+// ============================================================
+const SMTP_HOST = process.env.SMTP_HOST;
+const SMTP_PORT = process.env.SMTP_PORT || 587;
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const SMTP_FROM = process.env.SMTP_FROM || 'info@solutions.chemican.ca';
+
+let emailTransporter = null;
+if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+  try {
+    const nodemailer = require('nodemailer');
+    emailTransporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: parseInt(SMTP_PORT),
+      secure: parseInt(SMTP_PORT) === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS }
+    });
+    console.log('Email transporter configured');
+  } catch (e) {
+    console.warn('nodemailer not installed or SMTP config error:', e.message);
+  }
+} else {
+  console.warn('SMTP not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS env vars to enable email.');
+}
+
+// Send email endpoint
+app.post('/api/send-email', async (req, res) => {
+  if (!emailTransporter) {
+    return res.status(503).json({ error: 'Email service not configured. Set SMTP env vars.' });
+  }
+  const { to, subject, html, text } = req.body;
+  if (!to || !subject) {
+    return res.status(400).json({ error: 'Missing required fields: to, subject' });
+  }
+  try {
+    const info = await emailTransporter.sendMail({
+      from: SMTP_FROM,
+      to,
+      subject,
+      html: html || undefined,
+      text: text || undefined
+    });
+    console.log('Email sent:', info.messageId);
+    res.json({ success: true, messageId: info.messageId });
+  } catch (err) {
+    console.error('Email send error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Initialize the database and start the server
 initializeDatabase().then(() => {
   app.listen(port, () => {
