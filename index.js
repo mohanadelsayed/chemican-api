@@ -728,11 +728,8 @@ app.put('/api/tables/:tableName/:idOrGuid', async (req, res) => {
     delete data.id;
   }
 
-  // Remove guid if present to avoid overwriting the record guid
-  if (data.guid !== undefined) {
-    console.log(`[${tableName}] Removing guid property from data:`, data.guid);
-    delete data.guid;
-  }
+  // Allow guid updates only when explicitly the sole field (migration/sync use case)
+  // Previously stripped guid to prevent accidental overwrites, but sync needs it
 
   if (Object.keys(data).length === 0) {
     console.log(`[${tableName}] No update data provided after processing.`);
