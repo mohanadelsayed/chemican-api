@@ -978,6 +978,28 @@ if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
   console.warn('SMTP not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS env vars to enable email.');
 }
 
+// Proxy-fetch a public image URL (bypasses CORS for browser clients)
+app.post('/api/fetch-image', async (req, res) => {
+  const { url } = req.body;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'url is required' });
+  }
+  try {
+    const response = await axios.get(url, {
+      responseType: 'arraybuffer',
+      timeout: 30000,
+      maxContentLength: 25 * 1024 * 1024,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    });
+    const contentType = response.headers['content-type'] || 'image/jpeg';
+    const base64 = Buffer.from(response.data).toString('base64');
+    res.json({ data: base64, contentType, size: response.data.length });
+  } catch (err) {
+    console.error('Fetch-image error:', err.message);
+    res.status(502).json({ error: 'Failed to fetch image: ' + (err.response?.status || err.message) });
+  }
+});
+
 // Send email endpoint
 app.post('/api/send-email', async (req, res) => {
   if (!emailTransporter) {
