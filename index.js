@@ -57,9 +57,8 @@ async function initializeDatabase() {
     await initializeLastKnownIds();
     
     // Start polling for new records in monitored tables
-    if (POWER_AUTOMATE_WEBHOOK_URL) {
-      startRecordPolling();
-    }
+    // Polls regardless of webhook — also handles direct email notifications
+    startRecordPolling();
     
   } catch (err) {
     console.error('Failed to create database pool:', err);
@@ -1208,13 +1207,25 @@ let emailTransporter = null;
 if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
   try {
     const nodemailer = require('nodemailer');
+    const smtpPort = parseInt(SMTP_PORT);
     emailTransporter = nodemailer.createTransport({
       host: SMTP_HOST,
-      port: parseInt(SMTP_PORT),
-      secure: parseInt(SMTP_PORT) === 465,
-      auth: { user: SMTP_USER, pass: SMTP_PASS }
+      port: smtpPort,
+      secure: smtpPort === 465,
+      requireTLS: smtpPort === 587,
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+      tls: { ciphers: 'SSLv3', rejectUnauthorized: false },
+      connectionTimeout: 30000,
+      greetingTimeout: 30000,
+      socketTimeout: 30000
     });
-    console.log('Email transporter configured');
+    console.log(`Email transporter configured (${SMTP_HOST}:${smtpPort})`);
+    // Verify connection on startup
+    emailTransporter.verify().then(() => {
+      console.log('SMTP connection verified successfully');
+    }).catch(err => {
+      console.error('SMTP connection verification failed:', err.message);
+    });
   } catch (e) {
     console.warn('nodemailer not installed or SMTP config error:', e.message);
   }
