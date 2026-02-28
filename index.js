@@ -211,7 +211,7 @@ function startRecordPolling() {
 }
 
 async function checkForNewRecords() {
-  if (!POWER_AUTOMATE_WEBHOOK_URL || !isInitialCheckComplete) {
+  if (!isInitialCheckComplete) {
     return;
   }
   
@@ -1204,7 +1204,12 @@ const SMTP_PASS = process.env.SMTP_PASS;
 const SMTP_FROM = process.env.SMTP_FROM || 'info@solutions.chemican.ca';
 
 let emailTransporter = null;
-if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+
+async function initializeEmailTransporter() {
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
+    console.warn('SMTP not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS env vars to enable email.');
+    return;
+  }
   try {
     const nodemailer = require('nodemailer');
     const smtpPort = parseInt(SMTP_PORT);
@@ -1213,24 +1218,39 @@ if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
       port: smtpPort,
       secure: smtpPort === 465,
       requireTLS: smtpPort === 587,
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
-      tls: { ciphers: 'SSLv3', rejectUnauthorized: false },
+      auth: {
+        user: SMTP_USER,
+        pass: SMTP_PASS
+      },
+      tls: { rejectUnauthorized: false },
       connectionTimeout: 30000,
       greetingTimeout: 30000,
-      socketTimeout: 30000
+      socketTimeout: 60000,
+      logger: true,
+      debug: true
     });
-    console.log(`Email transporter configured (${SMTP_HOST}:${smtpPort})`);
-    // Verify connection on startup
-    emailTransporter.verify().then(() => {
-      console.log('SMTP connection verified successfully');
-    }).catch(err => {
-      console.error('SMTP connection verification failed:', err.message);
-    });
+    console.log(`Email transporter configured (${SMTP_HOST}:${smtpPort}, user: ${SMTP_USER})`);
+    // Verify connection — await so we know immediately
+    try {
+      await emailTransporter.verify();
+      console.log('SMTP connection verified successfully — emails will be sent');
+    } catch (err) {
+      console.error('========================================');
+      console.error('SMTP VERIFICATION FAILED:', err.message);
+      console.error('Error code:', err.code);
+      if (err.message.includes('535') || err.message.includes('Authentication')) {
+        console.error('>>> AUTH FAILURE: If MFA/2FA is enabled on this Office 365 account,');
+        console.error('>>> basic SMTP auth is blocked. Create an App Password at:');
+        console.error('>>> https://mysignins.microsoft.com/security-info');
+        console.error('>>> Or enable SMTP AUTH in M365 Admin > Users > Mail > Manage email apps');
+      }
+      console.error('========================================');
+      // Keep the transporter — it may work for some messages even if verify fails
+    }
   } catch (e) {
     console.warn('nodemailer not installed or SMTP config error:', e.message);
+    console.warn('Run: npm install nodemailer');
   }
-} else {
-  console.warn('SMTP not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS env vars to enable email.');
 }
 
 // Proxy-fetch a public image URL (bypasses CORS for browser clients)
@@ -1280,10 +1300,32 @@ app.post('/api/send-email', async (req, res) => {
   }
 });
 
-// Initialize the database and start the server
-initializeDatabase().then(() => {
+// Graceful shutdown — let in-flight operations finish
+let shuttingDown = false;
+process.on('SIGTERM', () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('SIGTERM received — graceful shutdown in 5s...');
+  setTimeout(() => {
+    console.log('Shutting down now.');
+    process.exit(0);
+  }, 5000);
+});
+process.on('SIGINT', () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('SIGINT received — shutting down...');
+  process.exit(0);
+});
+
+// Initialize the database, email, and start the server
+initializeDatabase().then(async () => {
+  // Initialize email transporter (await so verify completes before polling sends)
+  await initializeEmailTransporter();
+
   app.listen(port, () => {
     console.log(`Server running on port ${port}`);
+    console.log(`Polling active: every 10s | Email: ${emailTransporter ? 'configured' : 'disabled'}`);
   });
 }).catch(err => {
   console.error('Failed to initialize application:', err);
