@@ -15,9 +15,8 @@ const MYSQL_DATABASE = process.env.MYSQL_DATABASE;
 const MYSQL_PORT = process.env.MYSQL_PORT;
 const POWER_AUTOMATE_WEBHOOK_URL = process.env.POWER_AUTOMATE_WEBHOOK_URL;
 
-// Check if the webhook  URL is set
 if (!POWER_AUTOMATE_WEBHOOK_URL) {
-    console.warn("POWER_AUTOMATE_WEBHOOK_URL environment variable is not set. New record notifications to Power Automate will be disabled.");
+    console.warn("POWER_AUTOMATE_WEBHOOK_URL not set. Webhook notifications disabled.");
 }
 
 // Middleware
@@ -202,27 +201,31 @@ async function initializeBlogPostsState() {
   }
 }
 
+let pollingInProgress = false;
+
 function startRecordPolling() {
   // First immediate check
   checkForNewRecords();
-  
-  // Then check every 10 seconds
-  setInterval(checkForNewRecords, 10000);
+
+  // Then check every 30 seconds (avoids pile-up from overlapping cycles)
+  setInterval(checkForNewRecords, 30000);
 }
 
 async function checkForNewRecords() {
-  if (!isInitialCheckComplete) {
+  if (!isInitialCheckComplete || pollingInProgress) {
     return;
   }
   
+  pollingInProgress = true;
   try {
-    // Check for new records in each monitored table
     await checkForNewFormSubmissions();
     await checkForNewSubscribers();
     await checkForNewBlogComments();
     await checkForBlogPostViewCountChanges();
   } catch (err) {
     console.error('Error during record polling:', err);
+  } finally {
+    pollingInProgress = false;
   }
 }
 
@@ -260,15 +263,9 @@ async function checkForNewFormSubmissions() {
     for (const submission of newSubmissions) {
       try {
         if (submission.id > highestProcessedId) {
-          // Send the webhook notification
           await sendWebhookNotification('form_submits', submission);
-          // Send email notification directly
-          await sendFormSubmissionEmail(submission);
-
-          // Update our tracking variable
           highestProcessedId = submission.id;
-
-          console.log(`Successfully processed form submission ID: ${submission.id}`);
+          console.log(`Processed form submission ID: ${submission.id}`);
         } else {
           console.log(`Skipping already processed form submission ID: ${submission.id}`);
         }
@@ -331,15 +328,9 @@ async function checkForNewSubscribers() {
     for (const subscriber of newSubscribers) {
       try {
         if (subscriber.id > highestProcessedId) {
-          // Send the webhook notification
           await sendWebhookNotification('subscribers', subscriber);
-          // Send email notification directly
-          await sendSubscriberWelcomeEmail(subscriber);
-
-          // Update our tracking variable
           highestProcessedId = subscriber.id;
-
-          console.log(`Successfully processed subscriber ID: ${subscriber.id}`);
+          console.log(`Processed subscriber ID: ${subscriber.id}`);
         } else {
           console.log(`Skipping already processed subscriber ID: ${subscriber.id}`);
         }
@@ -402,15 +393,9 @@ async function checkForNewBlogComments() {
     for (const comment of newComments) {
       try {
         if (comment.id > highestProcessedId) {
-          // Send the webhook notification
           await sendWebhookNotification('blog_comments', comment);
-          // Send email notification directly
-          await sendCommentNotificationEmail(comment);
-
-          // Update our tracking variable
           highestProcessedId = comment.id;
-
-          console.log(`Successfully processed blog comment ID: ${comment.id}`);
+          console.log(`Processed blog comment ID: ${comment.id}`);
         } else {
           console.log(`Skipping already processed blog comment ID: ${comment.id}`);
         }
@@ -536,210 +521,6 @@ async function sendWebhookNotification(tableName, recordData) {
   }
 }
 
-// ============================================================
-// EMAIL NOTIFICATION TEMPLATES (replaces Power Automate email)
-// ============================================================
-const ADMIN_EMAIL = 'mohanad.elsayed@chemican.ca';
-const ADMIN_BCC = 'mohanad.elsayed@chemican.ca;support@chemican.ca';
-
-function decodeHtmlEntities(str) {
-  if (!str) return '';
-  return str.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&#39;/g, "'");
-}
-
-function formatDate() {
-  const now = new Date();
-  return now.toLocaleDateString('en-GB');  // dd/MM/yyyy
-}
-
-// BU 0 = Consulting (chemican.ca), BU 1 = Solutions (solutions.chemican.ca)
-function getBUConfig(bu) {
-  if (parseInt(bu) === 1) {
-    return {
-      name: 'ChemiCan Solutions',
-      logo: 'https://www.solutions.chemican.ca/images/Pictussre1.png',
-      color: '#0078d4',
-      from: SMTP_FROM || 'info@solutions.chemican.ca',
-      website: 'https://www.solutions.chemican.ca/',
-      email: 'info@solutions.chemican.ca',
-      phone: '+1 (825) 609-8387',
-      serviceLabel: 'digital services',
-      ctaText: 'Explore our services',
-      bcc: ADMIN_EMAIL
-    };
-  }
-  return {
-    name: 'ChemiCan Consulting',
-    logo: 'https://www.chemican.ca/images/logo/chemican-logo.png',
-    color: '#e63946',
-    from: SMTP_FROM || 'support@chemican.ca',
-    website: 'https://www.chemican.ca/',
-    email: 'support@chemican.ca',
-    phone: '+1 (403) 80-4343',
-    serviceLabel: 'services',
-    ctaText: 'Explore our services',
-    bcc: ADMIN_BCC
-  };
-}
-
-function buildEmailWrapper(bu, title, subtitle, bodyContent, ctaUrl, ctaText) {
-  const cfg = getBUConfig(bu);
-  return `<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head>
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>body, table, td { font-family: 'Arial', sans-serif !important; } a { color: ${cfg.color}; text-decoration: none; }</style>
-</head>
-<body>
-  <div style="background:white;min-height:100vh;color:#333;font-size:14px;">
-    <table border="0" cellpadding="0" cellspacing="0" width="100%" height="100%">
-      <tr><td></td><td width="640">
-        <table border="0" cellpadding="0" cellspacing="0" style="min-width:100%;background:white;">
-          <tr><td style="padding:24px 24px 30px;"><img src="${cfg.logo}" width="100" height="auto" alt="${cfg.name}"></td></tr>
-          <tr><td style="font-size:28px;padding:0 24px;font-weight:bold;color:${cfg.color}">${title}</td></tr>
-          <tr><td style="color:#333;padding:20px 24px 30px 24px;"><span style="font-weight:600">${subtitle}</span></td></tr>
-          <tr><td style="padding:0 24px 44px;">
-            <div><table style="font-size:100%;" width="100%" cellpadding="0" cellspacing="0" border="0" align="center">
-              ${bodyContent}
-            </table></div>
-            ${ctaUrl ? `<div style="padding-top:10px;"><a href="${ctaUrl}" target="_blank" style="background-color:${cfg.color};color:white;padding:10px 20px;text-decoration:none;border-radius:4px;display:inline-block;">${ctaText || cfg.ctaText}</a></div>` : ''}
-          </td></tr>
-          <tr><td>
-            <table border="0" cellpadding="0" cellspacing="0" width="100%" style="min-width:100%;background-color:#F3F3F3;">
-              <tr><td style="padding:20px 25px 10px;text-align:center;"></td></tr>
-              <tr><td style="padding:10px 25px 25px;font-size:12px;text-align:center;">
-                <div style="color:#666;margin-bottom:10px;">${cfg.name}<br>Alberta, Canada<br><a href="mailto:${cfg.email}" style="color:${cfg.color};">${cfg.email}</a></div>
-                <div style="margin-top:15px;"><img src="${cfg.logo}" width="40" height="auto" alt="${cfg.name}"></div>
-              </td></tr>
-            </table>
-          </td></tr>
-        </table>
-      </td><td></td></tr>
-    </table>
-  </div>
-</body>
-</html>`;
-}
-
-async function sendFormSubmissionEmail(submission) {
-  if (!emailTransporter) return;
-  const cfg = getBUConfig(submission.BU);
-  const refId = submission.id;
-  const name = decodeHtmlEntities(submission.name);
-  const message = decodeHtmlEntities(submission.message);
-
-  const bodyContent = `
-    <p style="margin-top:0">We've received your inquiry and we'll get back to you shortly. Your interest in our ${cfg.serviceLabel} is much appreciated.</p>
-    <p><b style="font-weight:600">Your inquiry details:</b></p>
-    <ul>
-      <li>Reference Number: INQ-${refId}</li>
-      <li>Submitted: ${formatDate()}</li>
-    </ul>
-    <p><b style="font-weight:600">What happens next?</b></p>
-    <p>One of our specialists will review your request and be in touch within 1-2 business days. If you have any immediate questions, feel free to call us at <a href="tel:${cfg.phone}">${cfg.phone}</a></p>
-    <br>`;
-
-  const html = buildEmailWrapper(submission.BU,
-    "We've Got Your Message!",
-    "Thanks for reaching out!",
-    bodyContent,
-    cfg.website,
-    cfg.ctaText
-  );
-
-  try {
-    await emailTransporter.sendMail({
-      from: cfg.from,
-      to: decodeHtmlEntities(submission.email),
-      bcc: cfg.bcc,
-      subject: `Your ${cfg.name} Inquiry INQ-${refId} - We've Received Your Message!`,
-      html
-    });
-    console.log(`Form submission email sent to ${submission.email} (INQ-${refId})`);
-  } catch (err) {
-    console.error('Email send error:', err.message);
-  }
-}
-
-async function sendSubscriberWelcomeEmail(subscriber) {
-  if (!emailTransporter) return;
-  const cfg = getBUConfig(subscriber.BU);
-  const blogUrl = parseInt(subscriber.BU) === 1
-    ? 'https://www.solutions.chemican.ca/insights/blog.html'
-    : 'https://www.chemican.ca/insights/blog.html';
-
-  const revolution = parseInt(subscriber.BU) === 1
-    ? 'Digitatl Transformation revolution'
-    : 'sustainability revolution';
-  const insightType = parseInt(subscriber.BU) === 1
-    ? 'industry insights, digitalization tips, and the latest innovative solutions'
-    : 'industry insights, sustainability tips, and the latest environmental innovations';
-  const resourceType = parseInt(subscriber.BU) === 1
-    ? 'immediate technology updates'
-    : 'immediate sustainability wisdom';
-
-  const bodyContent = `
-    <p style="margin-top:0;line-height:1.6;">We're thrilled to have you join the ChemiCan community! Your inbox is now set to receive our weekly digest packed with ${insightType}.</p>
-    <p style="line-height:1.6;"><b style="font-weight:600;color:${cfg.color};">Our promise to you:</b></p>
-    <ul style="line-height:1.6;padding-left:20px;">
-      <li><b>No inbox flooding</b> - Just one awesome weekly digest</li>
-      <li><b>Quality content only</b> - Curated insights you can actually use</li>
-      <li><b>Easy opt-out</b> - Freedom to leave anytime (but we hope you'll stay!)</li>
-    </ul>
-    <p style="line-height:1.6;margin-top:25px;">Your first digest will arrive next week. Until then, feel free to explore our <a href="${blogUrl}" style="color:${cfg.color};font-weight:bold;">resource center</a> for ${resourceType}!</p>
-    <br>`;
-
-  const html = buildEmailWrapper(subscriber.BU,
-    "You're In! \u{1F389}",
-    `Thanks for joining our ${revolution}!`,
-    bodyContent,
-    blogUrl,
-    'Check out our latest articles'
-  );
-
-  try {
-    await emailTransporter.sendMail({
-      from: cfg.from,
-      to: subscriber.email,
-      bcc: cfg.bcc,
-      subject: parseInt(subscriber.BU) === 1
-        ? "Welcome to the ChemiCan community! Your weekly dose of Technology insights"
-        : "Welcome to the ChemiCan community! Your weekly dose of sustainability insights",
-      html
-    });
-    console.log(`Subscriber welcome email sent to ${subscriber.email}`);
-  } catch (err) {
-    console.error('Email send error:', err.message);
-  }
-}
-
-async function sendCommentNotificationEmail(comment) {
-  if (!emailTransporter) return;
-  // Look up the blog post title
-  let postTitle = 'Unknown Post';
-  try {
-    const [posts] = await pool.query('SELECT title FROM blog_posts WHERE id = ?', [comment.post_id]);
-    if (posts.length) postTitle = posts[0].title;
-  } catch (e) { /* ignore */ }
-
-  try {
-    await emailTransporter.sendMail({
-      from: SMTP_FROM || 'support@chemican.ca',
-      to: ADMIN_EMAIL,
-      subject: 'New Comment is waiting for your approval',
-      html: `<p>Hello<br><br>A new comment has been submitted and is waiting for your approval.<br><br>
-        <b>Post:</b> ${postTitle}<br>
-        <b>Author:</b> ${decodeHtmlEntities(comment.author_name)} (${decodeHtmlEntities(comment.author_email)})<br>
-        <b>Comment:</b> ${decodeHtmlEntities(comment.content)}<br><br>
-        Please review and approve or reject the comment in the <a href="https://org49aacc6f.crm3.dynamics.com">ChemiCan ERP</a>.</p>`
-    });
-    console.log(`Comment notification email sent for post: ${postTitle}`);
-  } catch (err) {
-    console.error('Email send error:', err.message);
-  }
-}
-
 // Helper function to extract data from request body in different formats
 function extractDataFromRequest(req) {
   // If req.body.body.$ exists as a string (test tab format)
@@ -773,16 +554,6 @@ function extractDataFromRequest(req) {
     return req.body;
   }
 }
-// Test connection endpoint
-app.get('/api/test', async (req, res) => {
-  try {
-    const [results] = await pool.query('SELECT 1+1 AS result');
-    res.json({ message: 'Database connection successful', result: results[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Test connection endpoint
 app.get('/api/test', async (req, res) => {
   try {
@@ -1194,65 +965,6 @@ app.post('/api/force-check', async (req, res) => {
   }
 });
 
-// ============================================================
-// EMAIL NOTIFICATIONS (via nodemailer)
-// ============================================================
-const SMTP_HOST = process.env.SMTP_HOST;
-const SMTP_PORT = process.env.SMTP_PORT || 587;
-const SMTP_USER = process.env.SMTP_USER;
-const SMTP_PASS = process.env.SMTP_PASS;
-const SMTP_FROM = process.env.SMTP_FROM || 'info@solutions.chemican.ca';
-
-let emailTransporter = null;
-
-async function initializeEmailTransporter() {
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
-    console.warn('SMTP not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS env vars to enable email.');
-    return;
-  }
-  try {
-    const nodemailer = require('nodemailer');
-    const smtpPort = parseInt(SMTP_PORT);
-    emailTransporter = nodemailer.createTransport({
-      host: SMTP_HOST,
-      port: smtpPort,
-      secure: smtpPort === 465,
-      requireTLS: smtpPort === 587,
-      auth: {
-        user: SMTP_USER,
-        pass: SMTP_PASS
-      },
-      tls: { rejectUnauthorized: false },
-      connectionTimeout: 30000,
-      greetingTimeout: 30000,
-      socketTimeout: 60000,
-      logger: true,
-      debug: true
-    });
-    console.log(`Email transporter configured (${SMTP_HOST}:${smtpPort}, user: ${SMTP_USER})`);
-    // Verify connection — await so we know immediately
-    try {
-      await emailTransporter.verify();
-      console.log('SMTP connection verified successfully — emails will be sent');
-    } catch (err) {
-      console.error('========================================');
-      console.error('SMTP VERIFICATION FAILED:', err.message);
-      console.error('Error code:', err.code);
-      if (err.message.includes('535') || err.message.includes('Authentication')) {
-        console.error('>>> AUTH FAILURE: If MFA/2FA is enabled on this Office 365 account,');
-        console.error('>>> basic SMTP auth is blocked. Create an App Password at:');
-        console.error('>>> https://mysignins.microsoft.com/security-info');
-        console.error('>>> Or enable SMTP AUTH in M365 Admin > Users > Mail > Manage email apps');
-      }
-      console.error('========================================');
-      // Keep the transporter — it may work for some messages even if verify fails
-    }
-  } catch (e) {
-    console.warn('nodemailer not installed or SMTP config error:', e.message);
-    console.warn('Run: npm install nodemailer');
-  }
-}
-
 // Proxy-fetch a public image URL (bypasses CORS for browser clients)
 app.post('/api/fetch-image', async (req, res) => {
   const { url } = req.body;
@@ -1275,31 +987,6 @@ app.post('/api/fetch-image', async (req, res) => {
   }
 });
 
-// Send email endpoint
-app.post('/api/send-email', async (req, res) => {
-  if (!emailTransporter) {
-    return res.status(503).json({ error: 'Email service not configured. Set SMTP env vars.' });
-  }
-  const { to, subject, html, text } = req.body;
-  if (!to || !subject) {
-    return res.status(400).json({ error: 'Missing required fields: to, subject' });
-  }
-  try {
-    const info = await emailTransporter.sendMail({
-      from: SMTP_FROM,
-      to,
-      subject,
-      html: html || undefined,
-      text: text || undefined
-    });
-    console.log('Email sent:', info.messageId);
-    res.json({ success: true, messageId: info.messageId });
-  } catch (err) {
-    console.error('Email send error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Graceful shutdown — let in-flight operations finish
 let shuttingDown = false;
 process.on('SIGTERM', () => {
@@ -1318,14 +1005,11 @@ process.on('SIGINT', () => {
   process.exit(0);
 });
 
-// Initialize the database, email, and start the server
-initializeDatabase().then(async () => {
-  // Initialize email transporter (await so verify completes before polling sends)
-  await initializeEmailTransporter();
-
+// Initialize the database and start the server
+initializeDatabase().then(() => {
   app.listen(port, () => {
     console.log(`Server running on port ${port}`);
-    console.log(`Polling active: every 10s | Email: ${emailTransporter ? 'configured' : 'disabled'}`);
+    console.log(`Polling: every 30s | Webhook: ${POWER_AUTOMATE_WEBHOOK_URL ? 'configured' : 'disabled'}`);
   });
 }).catch(err => {
   console.error('Failed to initialize application:', err);
